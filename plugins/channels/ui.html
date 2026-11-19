@@ -1075,7 +1075,6 @@
         <span style="font-size:13px;color:var(--text-dim)">Select channels to batch hide, unhide, delete, or move. Click <strong>🔄 Reload TV</strong> to apply changes to tuner.</span>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <button type="button" class="btn-restore" id="btn-open-add" title="Add a new satellite channel manually" style="background:rgba(16,185,129,0.15);color:#10b981;border-color:rgba(16,185,129,0.35);font-weight:600;">➕ Add Channel</button>
         <button type="button" class="btn-restore" id="btn-reload-tv" title="Apply all changes and reload TV tuner">🔄 Reload TV</button>
         <button type="button" class="btn-restore" id="btn-export-bak" title="Export channel list as official Samsung Channel_list_*.zip (USB & ChanSort compatible)">💾 Export Backup</button>
         <button type="button" class="btn-restore" id="btn-import-bak" title="Import channel list from Samsung Channel_list_*.zip">📥 Import Backup</button>
@@ -1184,118 +1183,6 @@
   </div>
 </div>
 
-<!-- Add Channel Modal -->
-<div class="modal-backdrop" id="add-channel-modal" style="display:none;">
-  <div class="modal-dialog" style="max-width: 490px;">
-    <div class="modal-header-row">
-      <div class="modal-icon" style="background:rgba(16,185,129,0.15);border-color:rgba(16,185,129,0.3);color:#10b981;">➕</div>
-      <div class="modal-body">
-        <h3 class="modal-title">Add Satellite Channel</h3>
-        <p class="modal-text">Enter frequency to auto-detect channels or manually specify tuning details.</p>
-      </div>
-    </div>
-    <div id="form-add-channel" style="display:flex;flex-direction:column;gap:12px;margin-top:4px;">
-      
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div class="form-group">
-          <label class="form-label" for="add-ch-freq">Frequency (MHz) *</label>
-          <input type="number" id="add-ch-freq" class="form-input" placeholder="e.g. 11411 or 12054" required min="1000" max="30000">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Polarization *</label>
-          <div class="segmented-control" id="add-pol-group">
-            <button type="button" class="seg-btn active" data-pol="H">Horizontal (H)</button>
-            <button type="button" class="seg-btn" data-pol="V">Vertical (V)</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label" for="add-ch-sat">Satellite</label>
-        <select id="add-ch-sat" class="form-select">
-          <option value="35">Eutelsat 7/Nilesat 201</option>
-        </select>
-      </div>
-
-      <!-- Auto-lookup Transponder Channels & Warning Status -->
-      <div id="tp-lookup-container" style="display:none;flex-direction:column;gap:8px;">
-        <div id="tp-lookup-loading" style="display:none;font-size:12px;color:var(--text-dim);align-items:center;gap:6px;">
-          <span>🔍</span> Checking transponder channels…
-        </div>
-        <div id="tp-lookup-found" class="tp-lookup-card" style="display:none;">
-          <div style="display:flex;align-items:center;justify-content:space-between;">
-            <span style="font-size:12px;font-weight:600;color:var(--accent);" id="tp-lookup-found-title">📡 Channels on this frequency:</span>
-            <span style="font-size:11px;color:var(--text-dim);" id="tp-lookup-found-count"></span>
-          </div>
-          <select id="add-ch-picker" class="form-select" style="font-size:12.5px;padding:6px 8px;background:#131b2e;">
-            <option value="">-- Choose a channel to auto-fill --</option>
-          </select>
-        </div>
-        <div id="tp-lookup-warning" class="tp-lookup-warning" style="display:none;">
-          <strong>⚠️ New Frequency:</strong> No channels found on this transponder yet. Service ID (SID) & Video PID are required for playback. Enter them below from your satellite guide (e.g. FlySat/KingOfSat).
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label" for="add-ch-name">Channel Name *</label>
-        <input type="text" id="add-ch-name" class="form-input" placeholder="e.g. Al Majd 3" required autocomplete="off" dir="auto">
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div class="form-group">
-          <label class="form-label" for="add-ch-sid">Service ID (SID) *</label>
-          <input type="number" id="add-ch-sid" class="form-input" placeholder="e.g. 2218" min="1" max="65535" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label" for="add-ch-vpid">Video PID *</label>
-          <input type="number" id="add-ch-vpid" class="form-input" placeholder="e.g. 2310" min="1" max="8191" required>
-        </div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div class="form-group">
-          <label class="form-label" for="add-ch-num">Channel Number (#)</label>
-          <input type="number" id="add-ch-num" class="form-input" placeholder="Auto-assign next number" min="1" max="99999">
-        </div>
-        <div class="form-group">
-          <label class="form-label" for="add-ch-sr">Symbol Rate (KS/s)</label>
-          <input type="number" id="add-ch-sr" class="form-input" value="27500" placeholder="27500 or 30000">
-        </div>
-      </div>
-
-      <!-- Collapsible Advanced Tuning Options -->
-      <div style="margin-top:2px;">
-        <button type="button" id="btn-toggle-advanced" style="background:none;border:none;color:var(--accent);font-size:12.5px;font-weight:600;cursor:pointer;padding:4px 0;display:flex;align-items:center;gap:4px;">
-          <span id="adv-caret">▸</span> ⚙️ More Options (FEC, PCR PID)
-        </button>
-        <div id="adv-options-panel" style="display:none;margin-top:8px;padding:12px;background:#0d121f;border:1px solid var(--border);border-radius:var(--radius-s);flex-direction:column;gap:10px;">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-            <div class="form-group">
-              <label class="form-label" for="add-ch-fec">FEC</label>
-              <select id="add-ch-fec" class="form-select">
-                <option value="0">Auto</option>
-                <option value="3">3/4</option>
-                <option value="4">5/6</option>
-                <option value="2">2/3</option>
-                <option value="1">1/2</option>
-                <option value="5">7/8</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label class="form-label" for="add-ch-pcr">PCR PID</label>
-              <input type="number" id="add-ch-pcr" class="form-input" placeholder="Default: same as VPID" min="1" max="8191">
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-actions" style="margin-top:8px;">
-        <button type="button" class="btn-modal-cancel" id="add-btn-cancel">Cancel</button>
-        <button type="button" class="btn-modal-confirm" id="btn-submit-add" style="background:#10b981;border-color:#059669;">➕ Add Channel</button>
-      </div>
-    </div>
-  </div>
-</div>
 
 <!-- Rename Channel Modal -->
 <div class="modal-backdrop" id="rename-modal" style="display:none;">
@@ -1441,13 +1328,18 @@
     }, duration || 2500);
   }
 
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   function fetchChannels(refresh) {
     var url = 'list' + (refresh ? '?refresh=1' : '');
     fetch(url)
       .then(function (res) { return res.json(); })
       .then(function (data) {
         if (!data.ok) {
-          listEl.innerHTML = '<div class="state-message"><div class="icon">⚠️</div><p>Failed to load channels: ' + (data.error || 'Unknown error') + '</p></div>';
+          listEl.innerHTML = '<div class="state-message"><div class="icon">⚠️</div><p>Failed to load channels: ' + escapeHtml(data.error || 'Unknown error') + '</p></div>';
           return;
         }
 
@@ -1469,7 +1361,7 @@
         applyFilters();
       })
       .catch(function (err) {
-        listEl.innerHTML = '<div class="state-message"><div class="icon">⚠️</div><p>Network error connecting to TV daemon: ' + err.message + '</p></div>';
+        listEl.innerHTML = '<div class="state-message"><div class="icon">⚠️</div><p>Network error connecting to TV daemon: ' + escapeHtml(err.message || 'Error') + '</p></div>';
       });
   }
 
@@ -1633,10 +1525,32 @@
     var actionLabel = action === 'delete' ? 'deleted' : (action === 'hide' ? 'hidden' : 'unhidden');
     showToast('⏳ Updating ' + chNums.length + ' channels…', 3500);
 
+    var dvbsChannels = [];
+    var ipsrvChannels = [];
+    var selMap = {};
+    for (var s = 0; s < chNums.length; s++) {
+      selMap[chNums[s]] = true;
+    }
+
+    for (var i = 0; i < allChannels.length; i++) {
+      var ch = allChannels[i];
+      if (selMap[ch.num]) {
+        if (ch.type === 'iptv') {
+          ipsrvChannels.push(ch.num);
+        } else {
+          dvbsChannels.push(ch.num);
+        }
+      }
+    }
+
     fetch('edit', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ action: action, channels: chNums })
+      body: JSON.stringify({
+        action: action,
+        dvbs: dvbsChannels,
+        ipsrv: ipsrvChannels
+      })
     })
     .then(function (res) { return res.json(); })
     .then(function (data) {
@@ -1894,6 +1808,14 @@
     closeRenameModal();
     showToast('⏳ Renaming channel #' + targetNum + '…', 3000);
 
+    var targetType = 'dvbs';
+    for (var i = 0; i < allChannels.length; i++) {
+      if (allChannels[i].num === targetNum) {
+        if (allChannels[i].type === 'iptv') targetType = 'ipsrv';
+        break;
+      }
+    }
+
     fetch('edit', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1901,6 +1823,7 @@
         action: 'rename',
         channels: [targetNum],
         srvId: targetSrvId || undefined,
+        type: targetType,
         name: newName
       })
     })
@@ -2583,301 +2506,7 @@
     editorObserver.observe(editorBar);
   }
 
-  // Add Channel Modal & Form Logic
-  var btnOpenAdd = document.getElementById('btn-open-add');
-  var addChannelModal = document.getElementById('add-channel-modal');
-  var formAddChannel = document.getElementById('form-add-channel');
-  var addBtnCancel = document.getElementById('add-btn-cancel');
-  var addChName = document.getElementById('add-ch-name');
-  var addChFreq = document.getElementById('add-ch-freq');
-  var addChSat = document.getElementById('add-ch-sat');
-  var addChNum = document.getElementById('add-ch-num');
-  var addChSr = document.getElementById('add-ch-sr');
-  var addChSid = document.getElementById('add-ch-sid');
-  var addChVpid = document.getElementById('add-ch-vpid');
-  var addChPcr = document.getElementById('add-ch-pcr');
-  var addChFec = document.getElementById('add-ch-fec');
-  var btnToggleAdv = document.getElementById('btn-toggle-advanced');
-  var advOptionsPanel = document.getElementById('adv-options-panel');
-  var advCaret = document.getElementById('adv-caret');
-  var tpLookupContainer = document.getElementById('tp-lookup-container');
-  var tpLookupLoading = document.getElementById('tp-lookup-loading');
-  var tpLookupFound = document.getElementById('tp-lookup-found');
-  var tpLookupFoundTitle = document.getElementById('tp-lookup-found-title');
-  var tpLookupFoundCount = document.getElementById('tp-lookup-found-count');
-  var tpLookupWarning = document.getElementById('tp-lookup-warning');
-  var addChPicker = document.getElementById('add-ch-picker');
 
-  var currentSelectedPol = 'H';
-  var currentTpChannels = [];
-  var lookupTimer = null;
-  var srUserEdited = false;
-  var fecUserEdited = false;
-
-  if (addChSr) {
-    addChSr.addEventListener('input', function () { srUserEdited = true; });
-  }
-  if (addChFec) {
-    addChFec.addEventListener('change', function () { fecUserEdited = true; });
-  }
-
-  function highlightField(el) {
-    if (!el) return;
-    el.style.borderColor = '#ef4444';
-    el.style.boxShadow = '0 0 0 2px rgba(239, 68, 68, 0.35)';
-    setTimeout(function () {
-      el.style.borderColor = '';
-      el.style.boxShadow = '';
-    }, 2500);
-  }
-
-  // Toggle Polarization Segmented Control
-  var polButtons = document.querySelectorAll('#add-pol-group .seg-btn');
-  for (var pi = 0; pi < polButtons.length; pi++) {
-    polButtons[pi].addEventListener('click', function () {
-      for (var pj = 0; pj < polButtons.length; pj++) {
-        polButtons[pj].classList.remove('active');
-      }
-      this.classList.add('active');
-      currentSelectedPol = this.getAttribute('data-pol') || 'H';
-      triggerTpLookup();
-    });
-  }
-
-  // Toggle Advanced Options
-  if (btnToggleAdv && advOptionsPanel) {
-    btnToggleAdv.addEventListener('click', function () {
-      var isHidden = advOptionsPanel.style.display === 'none';
-      advOptionsPanel.style.display = isHidden ? 'flex' : 'none';
-      if (advCaret) advCaret.textContent = isHidden ? '▾' : '▸';
-    });
-  }
-
-  function hideAddModal() {
-    if (addChannelModal) addChannelModal.style.display = 'none';
-    if (lookupTimer) { clearTimeout(lookupTimer); lookupTimer = null; }
-  }
-
-  if (addBtnCancel) addBtnCancel.addEventListener('click', hideAddModal);
-  setupBackdropDismiss(addChannelModal, hideAddModal);
-
-  function triggerTpLookup() {
-    if (lookupTimer) clearTimeout(lookupTimer);
-    lookupTimer = setTimeout(performTpLookup, 300);
-  }
-
-  function performTpLookup() {
-    var freq = parseInt(addChFreq ? addChFreq.value : 0, 10);
-    var satId = parseInt(addChSat ? addChSat.value : 35, 10) || 35;
-    var pol = currentSelectedPol;
-
-    if (!freq || freq < 1000) {
-      if (tpLookupContainer) tpLookupContainer.style.display = 'none';
-      if (tpLookupFound) tpLookupFound.style.display = 'none';
-      if (tpLookupWarning) tpLookupWarning.style.display = 'none';
-      if (tpLookupLoading) tpLookupLoading.style.display = 'none';
-      currentTpChannels = [];
-      return;
-    }
-
-    if (tpLookupContainer) tpLookupContainer.style.display = 'flex';
-    if (tpLookupLoading) tpLookupLoading.style.display = 'flex';
-    if (tpLookupFound) tpLookupFound.style.display = 'none';
-    if (tpLookupWarning) tpLookupWarning.style.display = 'none';
-
-    fetch('tp_channels?freq=' + freq + '&pol=' + pol + '&satId=' + satId)
-      .then(function (res) { return res.json(); })
-      .then(function (data) {
-        if (tpLookupLoading) tpLookupLoading.style.display = 'none';
-        if (data && data.ok && data.found && data.channels && data.channels.length > 0) {
-          currentTpChannels = data.channels;
-          if (tpLookupFound) tpLookupFound.style.display = 'flex';
-          if (tpLookupWarning) tpLookupWarning.style.display = 'none';
-          if (tpLookupFoundTitle) tpLookupFoundTitle.textContent = '📡 ' + data.channels.length + ' channels on this frequency:';
-          if (tpLookupFoundCount) tpLookupFoundCount.textContent = (data.tpSr || 27500) + ' KS/s';
-
-          if (!srUserEdited && addChSr && data.tpSr) addChSr.value = data.tpSr;
-          if (!fecUserEdited && addChFec && data.tpFec !== undefined) addChFec.value = String(data.tpFec);
-
-          var pickHtml = '<option value="">-- Choose a channel to auto-fill --</option>';
-          for (var c = 0; c < data.channels.length; c++) {
-            var ch = data.channels[c];
-            pickHtml += '<option value="' + c + '">' + escapeHtml(ch.name) + ' (SID: ' + ch.sid + ', VPID: ' + ch.vpid + ')</option>';
-          }
-          if (addChPicker) {
-            addChPicker.innerHTML = pickHtml;
-            addChPicker.value = '';
-          }
-        } else {
-          currentTpChannels = [];
-          if (tpLookupFound) tpLookupFound.style.display = 'none';
-          if (tpLookupWarning) tpLookupWarning.style.display = 'block';
-        }
-      })
-      .catch(function () {
-        if (tpLookupLoading) tpLookupLoading.style.display = 'none';
-        if (tpLookupFound) tpLookupFound.style.display = 'none';
-        if (tpLookupWarning) tpLookupWarning.style.display = 'block';
-      });
-  }
-
-  if (addChPicker) {
-    addChPicker.addEventListener('change', function () {
-      var idx = parseInt(this.value, 10);
-      if (!isNaN(idx) && currentTpChannels[idx]) {
-        var selected = currentTpChannels[idx];
-        if (addChName) addChName.value = selected.name || '';
-        if (addChSid) addChSid.value = selected.sid || '';
-        if (addChVpid) addChVpid.value = selected.vpid || '';
-        if (addChPcr && selected.pcr) addChPcr.value = selected.pcr;
-        showToast('✓ Auto-filled ' + selected.name + ' (SID: ' + selected.sid + ', VPID: ' + selected.vpid + ')', 2500);
-      }
-    });
-  }
-
-  if (addChFreq) addChFreq.addEventListener('input', triggerTpLookup);
-  if (addChSat) addChSat.addEventListener('change', triggerTpLookup);
-
-  function loadSatellitesAndOpen() {
-    fetch('satellites')
-      .then(function (res) { return res.json(); })
-      .then(function (data) {
-        if (data && data.ok && data.satellites && addChSat) {
-          var satHtml = '';
-          for (var s = 0; s < data.satellites.length; s++) {
-            var satItem = data.satellites[s];
-            var sel = satItem.id === data.defaultSatId ? ' selected' : '';
-            var countLabel = satItem.count > 0 ? ' (' + satItem.count + ' ch)' : '';
-            satHtml += '<option value="' + satItem.id + '"' + sel + '>' + escapeHtml(satItem.name) + countLabel + '</option>';
-          }
-          addChSat.innerHTML = satHtml;
-          if (addChNum && data.nextMajor) {
-            addChNum.placeholder = 'Next available: #' + data.nextMajor;
-            addChNum.value = data.nextMajor;
-          }
-        }
-      })
-      .catch(function () {});
-
-    // Reset inputs
-    srUserEdited = false;
-    fecUserEdited = false;
-    if (addChName) addChName.value = '';
-    if (addChFreq) addChFreq.value = '';
-    currentSelectedPol = 'H';
-    for (var p = 0; p < polButtons.length; p++) {
-      if (polButtons[p].getAttribute('data-pol') === 'H') polButtons[p].classList.add('active');
-      else polButtons[p].classList.remove('active');
-    }
-    if (addChSr) addChSr.value = '27500';
-    if (addChFec) addChFec.value = '0';
-    if (addChSid) addChSid.value = '';
-    if (addChVpid) addChVpid.value = '';
-    if (addChPcr) addChPcr.value = '';
-    if (addChPicker) {
-      addChPicker.innerHTML = '<option value="">-- Choose a channel to auto-fill --</option>';
-      addChPicker.value = '';
-    }
-    if (tpLookupContainer) tpLookupContainer.style.display = 'none';
-    if (tpLookupFound) tpLookupFound.style.display = 'none';
-    if (tpLookupWarning) tpLookupWarning.style.display = 'none';
-    if (tpLookupLoading) tpLookupLoading.style.display = 'none';
-    currentTpChannels = [];
-    if (advOptionsPanel) advOptionsPanel.style.display = 'none';
-    if (advCaret) advCaret.textContent = '▸';
-
-    if (addChannelModal) addChannelModal.style.display = 'flex';
-    setTimeout(function () {
-      if (addChFreq) addChFreq.focus();
-    }, 100);
-  }
-
-  if (btnOpenAdd) {
-    btnOpenAdd.addEventListener('click', loadSatellitesAndOpen);
-  }
-
-  var btnSubmitAdd = document.getElementById('btn-submit-add');
-
-  function doAddChannel() {
-    var name = (addChName ? addChName.value : '').trim();
-    var freq = parseInt(addChFreq ? addChFreq.value : 0, 10);
-    var major = parseInt(addChNum ? addChNum.value : 0, 10) || 0;
-    var satId = parseInt(addChSat ? addChSat.value : 35, 10) || 35;
-    var sr = parseInt(addChSr ? addChSr.value : 27500, 10) || 27500;
-    var fec = parseInt(addChFec ? addChFec.value : 0, 10) || 0;
-    var sid = parseInt(addChSid ? addChSid.value : 0, 10) || 0;
-    var vpid = parseInt(addChVpid ? addChVpid.value : 0, 10) || 0;
-    var pcr = parseInt(addChPcr ? addChPcr.value : 0, 10) || vpid;
-
-    if (!name) {
-      showToast('⚠️ Please enter a channel name', 2500);
-      if (addChName) { addChName.focus(); highlightField(addChName); }
-      return;
-    }
-    if (!freq || isNaN(freq) || freq < 1000) {
-      showToast('⚠️ Please enter a valid frequency (e.g. 11411 or 12054)', 2500);
-      if (addChFreq) { addChFreq.focus(); highlightField(addChFreq); }
-      return;
-    }
-    if (!sid || sid <= 0) {
-      showToast('⚠️ Service ID (SID) is required so TV can decode channel', 3500);
-      if (addChSid) { addChSid.focus(); highlightField(addChSid); }
-      return;
-    }
-    if (!vpid || vpid <= 0) {
-      showToast('⚠️ Video PID is required so TV can decode video stream', 3500);
-      if (addChVpid) { addChVpid.focus(); highlightField(addChVpid); }
-      return;
-    }
-
-    showToast('⏳ Adding channel "' + name + '"…', 4000);
-    hideAddModal();
-
-    fetch('add_channel', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        name: name,
-        freq: freq,
-        pol: currentSelectedPol,
-        satId: satId,
-        major: major,
-        sr: sr,
-        fec: fec,
-        progNum: sid,
-        vidPid: vpid,
-        pcr: pcr
-      })
-    })
-    .then(function (res) { return res.json(); })
-    .then(function (data) {
-      if (data.ok) {
-        showToast('✅ ' + (data.message || 'Channel added successfully!'), 3000);
-        fetchChannels(true);
-      } else {
-        showToast('⚠️ Failed to add channel: ' + (data.error || 'error'), 3500);
-      }
-    })
-    .catch(function (err) {
-      showToast('⚠️ Error: ' + err.message, 3500);
-    });
-  }
-
-  if (btnSubmitAdd) {
-    btnSubmitAdd.addEventListener('click', doAddChannel);
-  }
-
-  function onAddInputKeyDown(e) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      doAddChannel();
-    }
-  }
-  if (addChName) addChName.addEventListener('keydown', onAddInputKeyDown);
-  if (addChFreq) addChFreq.addEventListener('keydown', onAddInputKeyDown);
-  if (addChNum) addChNum.addEventListener('keydown', onAddInputKeyDown);
-  if (addChSid) addChSid.addEventListener('keydown', onAddInputKeyDown);
-  if (addChVpid) addChVpid.addEventListener('keydown', onAddInputKeyDown);
 
   // Infinite Scroll Handler
   window.addEventListener('scroll', function () {
