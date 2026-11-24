@@ -38,7 +38,7 @@ Adds a unified **Channels** tab to the Vetro dashboard:
 | `/usr/bin/input_keyevent <keysym>` | Sends remote key events strictly from the allow-list: `XF86AudioRaiseVolume`, `XF86AudioLowerVolume`, `XF86AudioMute`, `XF86RaiseChannel`, `XF86LowerChannel`, `XF86Exit` |
 | `sqlite3 -bail ...` | Reads channel tables (optional missing DBs skipped), creates online `.backup` pre-edit snapshots, runs single/`ATTACH` `-bail` SQL scripts (`ch_del_*`, `ch_mv_*`, `ch_vis_*`, `ch_ren_*`), and checkpoints WAL logs |
 | `sqlite3 [-readonly] <dbPath> "PRAGMA integrity_check;" / "PRAGMA user_version;" / "SELECT name FROM sqlite_master ..." / "PRAGMA table_info(...);"` | Verifies SQLite integrity, schema tables, columns, and `user_version` during import and backup restore |
-| `sh -c "..."` | Runs serialized export, reload, import validation/swap, restore, and pre-edit backup scripts |
+| `echo <base64> \| base64 -d \| sh` | Runs serialized SQLite, export, reload, import validation/swap, restore, TV source, and pre-edit backup scripts cleanly through Vetro's root agent |
 | `/usr/bin/flock -n 9` | Serializes stopped-daemon swap, restore, and reload operations on `/tmp/vetro_channels_db.lock` |
 | `systemctl cat` / `stop` / `start` / `restart` `tvs_deamon.service` (fallback `tvs_daemon.service`, or `pkill -9 tvs-daemon` on reload only if unit absent) | Resolves the service unit, cleanly stops it during DB replacement, guarantees restart via shell `EXIT` trap, and restarts it on **Reload TV** |
 | `cp` / `cp -p` / `mv` / `chmod` / `chown` / `wc` | Manages atomic backup rotation into `<shard-dir>/backup/`, sets root permissions on TV DBs, and verifies extracted file sizes and symlinks |

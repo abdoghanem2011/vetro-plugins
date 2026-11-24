@@ -41,6 +41,16 @@ function shQuote(s) {
     return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
+// Node 4.4 inherits Buffer.from from Uint8Array (does not accept strings); Node 5.10+ has real Buffer.from.
+function toUtf8Bytes(s) {
+    return (Buffer.from && Buffer.from !== Uint8Array.from) ? Buffer.from(s, 'utf8') : new Buffer(s, 'utf8');
+}
+
+// Run shell scripts via base64 pipe so Vetro's root agent never mangles nested quotes or backslashes.
+function wrapSh(script) {
+    return 'echo ' + toUtf8Bytes(script).toString('base64') + ' | base64 -d | sh';
+}
+
 function sqlPath(p) {
     return String(p).replace(/\\/g, '/').replace(/'/g, "''");
 }
@@ -240,21 +250,21 @@ function parseSchemaOutput(stdout) {
 
 function inspectDbSchema(ctx, dbPath) {
     var qDb = shQuote(dbPath);
-    var cmd = 'sh -c ' + shQuote(
+    var cmd = wrapSh(
         'DB=' + qDb + '; ' +
         'if [ ! -f "$DB" ]; then echo "__MISSING__=1"; exit 2; fi; ' +
-        'RO=""; sqlite3 -readonly "$DB" "SELECT 1;" >/dev/null 2>&1 && RO="-readonly"; ' +
-        'INT=$(sqlite3 $RO "$DB" "PRAGMA integrity_check;" 2>/dev/null | tr "\\n" " "); ' +
-        'VER=$(sqlite3 $RO "$DB" "PRAGMA user_version;" 2>/dev/null || echo "0"); ' +
+        'RO=""; sqlite3 -readonly "$DB" "SELECT 1;" </dev/null >/dev/null 2>&1 && RO="-readonly"; ' +
+        'INT=$(sqlite3 $RO "$DB" "PRAGMA integrity_check;" </dev/null 2>/dev/null | tr "\\n" " "); ' +
+        'VER=$(sqlite3 $RO "$DB" "PRAGMA user_version;" </dev/null 2>/dev/null || echo "0"); ' +
         'echo "__INTEGRITY__=$INT"; ' +
         'echo "__VERSION__=$VER"; ' +
         'set -f; ' +
-        'sqlite3 $RO "$DB" "SELECT name FROM sqlite_master WHERE type=\'table\' AND name NOT LIKE \'sqlite_%\' ORDER BY name;" 2>/dev/null | ' +
+        'sqlite3 $RO "$DB" "SELECT name FROM sqlite_master WHERE type=\'table\' AND name NOT LIKE \'sqlite_%\' ORDER BY name;" </dev/null 2>/dev/null | ' +
         'while IFS= read -r t; do ' +
         '  [ -z "$t" ] && continue; ' +
         '  case "$t" in ' +
         '    *[!A-Za-z0-9_]*) echo "__BAD_TABLE__=$t" ;; ' +
-        '    *) echo "__TABLE__=$t"; sqlite3 $RO "$DB" "PRAGMA table_info($t);" 2>/dev/null ;; ' +
+        '    *) echo "__TABLE__=$t"; sqlite3 $RO "$DB" "PRAGMA table_info($t);" </dev/null 2>/dev/null ;; ' +
         '  esac; ' +
         'done'
     );
@@ -668,7 +678,7 @@ function planDeleteAndCompact(dbChannels, delSrvIdSet, options) {
 
 function queryChannelsForEdit(ctx, dbPath, defaultSrvType) {
     var sql = 'PRAGMA busy_timeout = 5000; SELECT srvId, major, IFNULL(srvType, ' + defaultSrvType + '), IFNULL(hidden, 0) FROM SRV WHERE elim = 0 ORDER BY major ASC, srvId ASC;';
-    var cmd = 'sqlite3 -bail ' + shQuote(dbPath) + ' ' + shQuote(sql);
+    var cmd = wrapSh('sqlite3 -bail ' + shQuote(dbPath) + ' ' + shQuote(sql) + ' </dev/null');
     return ctx.execute(cmd, 10000).then(function (qRes) {
         if (qRes.exit_code !== 0) {
             return Promise.reject(new Error('Failed to query channels from ' + dbPath + ': ' + (qRes.stderr || 'exit code ' + qRes.exit_code)));
@@ -704,7 +714,7 @@ function runSqlFile(ctx, tmpRoot, dbPath, sqlParts, prefix, timeoutMs) {
     } catch (fsErr) {
         return Promise.reject(new Error('Failed to write temp SQL file: ' + fsErr.message));
     }
-    var cmd = 'sqlite3 -bail ' + shQuote(dbPath) + ' < ' + shQuote(tmpFile) + '; RC=$?; rm -f ' + shQuote(tmpFile) + '; exit $RC';
+    var cmd = wrapSh('sqlite3 -bail ' + shQuote(dbPath) + ' < ' + shQuote(tmpFile) + '; RC=$?; rm -f ' + shQuote(tmpFile) + '; exit $RC');
     return ctx.execute(cmd, timeoutMs || 15000).then(function (res) {
         try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) {}
         if (res.exit_code !== 0) {
@@ -896,7 +906,7 @@ function channelsPlugin(ctx) {
             fileArgs += (j > 0 ? ' ' : '') + qf;
             var bkSql = ".backup '" + sqlPath(path.join(preEditDir + '.new', bf)) + "'";
             bakSteps += 'if [ -f "$DATA_DIR/"' + qf + ' ]; then ' +
-                'sqlite3 -bail "$DATA_DIR/"' + qf + ' ' + shQuote(bkSql) + ' >/dev/null 2>&1 || { rm -rf "$NEW_DIR" "$META_TMP"; echo ' + shQuote('BACKUP_SQLITE_FAILED_' + bf) + '; exit 13; }; ' +
+                'sqlite3 -bail "$DATA_DIR/"' + qf + ' ' + shQuote(bkSql) + ' </dev/null >/dev/null 2>&1 || { rm -rf "$NEW_DIR" "$META_TMP"; echo ' + shQuote('BACKUP_SQLITE_FAILED_' + bf) + '; exit 13; }; ' +
                 'fi; ';
         }
 
@@ -925,7 +935,7 @@ function channelsPlugin(ctx) {
             'rm -rf "$OLD_DIR"; ' +
             'echo "BACKUP_OK"';
 
-        return ctx.execute('sh -c ' + shQuote(script), 15000).then(function (r) {
+        return ctx.execute(wrapSh(script), 15000).then(function (r) {
             try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
             if (r.exit_code !== 0) {
                 return Promise.reject(new Error('Pre-edit backup failed (' + ((r.stdout || '').trim() || r.stderr || 'exit code ' + r.exit_code) + '); edit aborted to protect existing data.'));
@@ -941,11 +951,11 @@ function channelsPlugin(ctx) {
     // Validates zip integrity & uncompressed bounds (unzip -t / -l), extracts only allowlisted
     // non-symlink entries, checks SQLite integrity & live TV schema match, and detects region/model mismatch.
     function runPhase1Validation(uploadZip, tmpDir, sourceName) {
-        var listCmd = 'sh -c ' + shQuote(
+        var listCmd = wrapSh(
             'UP=' + shQuote(uploadZip) + '; ' +
-            'if ! /usr/bin/unzip -t "$UP" >/dev/null 2>&1; then rm -f "$UP"; echo "INVALID_ZIP"; exit 1; fi; ' +
+            'if ! /usr/bin/unzip -t "$UP" </dev/null >/dev/null 2>&1; then rm -f "$UP"; echo "INVALID_ZIP"; exit 1; fi; ' +
             'echo "__LIST_START__"; ' +
-            '/usr/bin/unzip -l "$UP"; ' +
+            '/usr/bin/unzip -l "$UP" </dev/null; ' +
             'RC=$?; ' +
             'echo "__LIST_END__"; ' +
             'exit $RC'
@@ -972,11 +982,11 @@ function channelsPlugin(ctx) {
                 extractArgs += (ei > 0 ? ' ' : '') + shQuote(parsedList.extractFiles[ei]);
             }
             var ownerUg = getDirOwnerUg();
-            var extractCmd = 'sh -c ' + shQuote(
+            var extractCmd = wrapSh(
                 'UP=' + shQuote(uploadZip) + '; ' +
                 'TMP=' + shQuote(tmpDir) + '; ' +
                 'rm -rf "$TMP" && mkdir -p "$TMP" || { rm -f "$UP"; echo "EXTRACT_MKDIR_FAILED"; exit 1; }; ' +
-                '/usr/bin/unzip -o -q "$UP" ' + extractArgs + ' -d "$TMP/" >/dev/null 2>&1; RC=$?; rm -f "$UP"; ' +
+                '/usr/bin/unzip -o -q "$UP" ' + extractArgs + ' -d "$TMP/" </dev/null >/dev/null 2>&1; RC=$?; rm -f "$UP"; ' +
                 'if [ $RC -ne 0 ]; then rm -rf "$TMP"; echo "INVALID_ZIP"; exit 1; fi; ' +
                 'TOTAL_SZ=0; DBS=""; ' +
                 'for f in ' + extractArgs + '; do ' +
@@ -1146,7 +1156,7 @@ function channelsPlugin(ctx) {
             '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
             TVS_UNIT_RESOLVE +
             'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
-            'systemctl stop "$UNIT" >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
+            'systemctl stop "$UNIT" </dev/null >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
             'DATA_DIR=' + shQuote(dataDir) + '; ' +
             'TMP_DIR=' + shQuote(tmpDir) + '; ' +
             'BACKUP_BASE=' + shQuote(backupDir) + '; ' +
@@ -1157,11 +1167,11 @@ function channelsPlugin(ctx) {
             'RESTARTED=0; ' +
             'cleanup_on_exit() { ' +
             '  rm -rf "$TMP_DIR" "$META_TMP" 2>/dev/null || true; ' +
-            '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
+            '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
             '}; ' +
             'trap cleanup_on_exit EXIT; ' +
             'for f in dvbs sat ipsrv dvbt dvbc; do ' +
-            '  if [ -f "$DATA_DIR/$f" ]; then sqlite3 "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; fi; ' +
+            '  if [ -f "$DATA_DIR/$f" ]; then sqlite3 "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" </dev/null >/dev/null 2>&1 || true; fi; ' +
             'done; ' +
             'mkdir -p "$BACKUP_BASE" || { echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
             'rm -rf "$BACKUP_NEW" "$BACKUP_OLD"; ' +
@@ -1193,14 +1203,14 @@ function channelsPlugin(ctx) {
             '  echo "COPY_ROLLED_BACK"; exit 14; ' +
             'fi; ' +
             'for f in ' + fileArgs + '; do ' +
-            '  [ -f "$DATA_DIR/$f" ] && sqlite3 "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; ' +
+            '  [ -f "$DATA_DIR/$f" ] && sqlite3 "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" </dev/null >/dev/null 2>&1 || true; ' +
             'done; ' +
-            'systemctl start "$UNIT" >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
+            'systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
             'RESTARTED=1; ' +
             'sleep 1; ' +
             'echo "SUCCESS"';
 
-        return ctx.execute('sh -c ' + shQuote(script), 30000).then(function (r) {
+        return ctx.execute(wrapSh(script), 30000).then(function (r) {
             try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
             rmrfSync(tmpDir);
             var out = String(r.stdout || '').trim();
@@ -1275,11 +1285,11 @@ function channelsPlugin(ctx) {
             "SELECT major, srvName, 0, -1, 0, '', scrambled, hidden, srvId, IFNULL(srvType, 1) " +
             'FROM SRV WHERE elim = 0 ORDER BY major ASC, srvId ASC;';
 
-        var cmd = 'sh -c ' + shQuote(
+        var cmd = wrapSh(
             'DB=' + shQuote(dvbsPath) + '; SAT=' + shQuote(satPath) + '; ' +
             'if [ ! -f "$DB" ]; then echo "__NO_DB__"; exit 0; fi; ' +
-            'if [ -f "$SAT" ]; then sqlite3 -bail "$DB" ' + shQuote(sqlWithSat) + '; ' +
-            'else sqlite3 -bail "$DB" ' + shQuote(sqlNoSat) + '; fi'
+            'if [ -f "$SAT" ]; then sqlite3 -bail "$DB" ' + shQuote(sqlWithSat) + ' </dev/null; ' +
+            'else sqlite3 -bail "$DB" ' + shQuote(sqlNoSat) + ' </dev/null; fi'
         );
 
         return ctx.execute(cmd, 10000).then(function (res) {
@@ -1329,10 +1339,10 @@ function channelsPlugin(ctx) {
 
             // Also query IPTV (Samsung TV Plus) from ipsrv
             var sqlIp = 'PRAGMA busy_timeout = 3000; SELECT major, srvName, hidden, srvId, IFNULL(srvType, -1) FROM SRV WHERE elim = 0 ORDER BY major ASC, srvId ASC;';
-            var cmdIp = 'sh -c ' + shQuote(
+            var cmdIp = wrapSh(
                 'DB=' + shQuote(ipsrvPath) + '; ' +
                 'if [ ! -f "$DB" ]; then echo "__NO_DB__"; exit 0; fi; ' +
-                'sqlite3 -bail "$DB" ' + shQuote(sqlIp)
+                'sqlite3 -bail "$DB" ' + shQuote(sqlIp) + ' </dev/null'
             );
 
             return ctx.execute(cmdIp, 5000).then(function (resIp) {
@@ -1505,7 +1515,7 @@ function channelsPlugin(ctx) {
 
             // POST api/tvsource — switch input directly to Broadcast TV
             if ((sub === 'tvsource' || action === 'tvsource') && req.method === 'POST') {
-                var switchCmd = 'sh -c "/usr/bin/input_keyevent XF86Exit; /usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user"';
+                var switchCmd = wrapSh('/usr/bin/input_keyevent XF86Exit </dev/null; /usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user </dev/null');
                 ctx.execute(switchCmd, 6000).then(function (r) {
                     sendJson(res, 200, { ok: r.exit_code === 0 });
                 }, function (e) {
@@ -1521,8 +1531,8 @@ function channelsPlugin(ctx) {
                         'exec 9>' + shQuote(lockFile) + '; ' +
                         '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
                         TVS_UNIT_RESOLVE +
-                        'if [ -n "$UNIT" ]; then systemctl restart "$UNIT"; else pkill -9 tvs-daemon || true; fi && sleep 1';
-                    ctx.execute('sh -c ' + shQuote(reloadScript), 8000).then(function (r) {
+                        'if [ -n "$UNIT" ]; then systemctl restart "$UNIT" </dev/null; else pkill -9 tvs-daemon || true; fi && sleep 1';
+                    ctx.execute(wrapSh(reloadScript), 8000).then(function (r) {
                         release();
                         if (r.exit_code === 10 || (r.stdout || '').indexOf('LOCKED') >= 0) {
                             sendJson(res, 409, { ok: false, error: 'Database lock held by another operation. Please retry.' });
@@ -1902,7 +1912,7 @@ function channelsPlugin(ctx) {
                 withDbLock(res, function (release) {
                     var expId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
                     var tmpZipPath = path.join(tmpRoot, 'ch_exp_' + expId + '.zip');
-                    var exportCmd = 'sh -c ' + shQuote(
+                    var exportCmd = wrapSh(
                         'PRD="/etc/prd_info.ini"; ' +
                         'VER=""; ' +
                         'if [ -f "$PRD" ]; then VER=$(grep -i "^Version=" "$PRD" | head -n 1 | cut -d "=" -f2 | tr -d ";\\r\\n "); fi; ' +
@@ -1912,12 +1922,12 @@ function channelsPlugin(ctx) {
                         'cd ' + shQuote(dataDir) + ' || exit 1; ' +
                         'FILES=""; ' +
                         'for f in dvbs sat ipsrv dvbt dvbc; do ' +
-                        '  if [ -f "$f" ]; then sqlite3 -bail "$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; FILES="$FILES $f"; fi; ' +
+                        '  if [ -f "$f" ]; then sqlite3 -bail "$f" "PRAGMA wal_checkpoint(TRUNCATE);" </dev/null >/dev/null 2>&1 || true; FILES="$FILES $f"; fi; ' +
                         'done; ' +
                         'if [ -f "metadata.xml" ]; then FILES="$FILES metadata.xml"; fi; ' +
                         'if [ -z "$FILES" ]; then echo "NO_FILES"; exit 2; fi; ' +
                         'rm -f "$ZIPPATH"; ' +
-                        '/usr/bin/zip -j "$ZIPPATH" $FILES >/dev/null 2>&1 || exit 3; ' +
+                        '/usr/bin/zip -j "$ZIPPATH" $FILES </dev/null >/dev/null 2>&1 || exit 3; ' +
                         'echo "$ZIPNAME"'
                     );
 
@@ -2228,14 +2238,14 @@ function channelsPlugin(ctx) {
                                     '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
                                     TVS_UNIT_RESOLVE +
                                     'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
-                                    'systemctl stop "$UNIT" >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
+                                    'systemctl stop "$UNIT" </dev/null >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
                                     'DATA_DIR=' + shQuote(dataDir) + '; ' +
                                     'BACKUP_DIR=' + shQuote(slotDir) + '; ' +
                                     'RB_DIR=' + shQuote(rbDir) + '; ' +
                                     'RESTARTED=0; ' +
                                     'cleanup_start() { ' +
                                     '  rm -rf "$RB_DIR" 2>/dev/null || true; ' +
-                                    '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
+                                    '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
                                     '}; ' +
                                     'trap cleanup_start EXIT; ' +
                                     'rm -rf "$RB_DIR" && mkdir -p "$RB_DIR" || { echo "RESTORE_RB_MKDIR_FAILED"; exit 13; }; ' +
@@ -2260,14 +2270,14 @@ function channelsPlugin(ctx) {
                                     '  echo "RESTORE_ROLLED_BACK"; exit 14; ' +
                                     'fi; ' +
                                     'for f in ' + fileArgs + '; do ' +
-                                    '  [ -f "$DATA_DIR/$f" ] && sqlite3 -bail "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; ' +
+                                    '  [ -f "$DATA_DIR/$f" ] && sqlite3 -bail "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" </dev/null >/dev/null 2>&1 || true; ' +
                                     'done; ' +
-                                    'systemctl start "$UNIT" >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
+                                    'systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
                                     'RESTARTED=1; ' +
                                     'sleep 1; ' +
                                     'echo "SUCCESS"';
 
-                                return ctx.execute('sh -c ' + shQuote(restoreScript), 25000).then(function (r) {
+                                return ctx.execute(wrapSh(restoreScript), 25000).then(function (r) {
                                     release();
                                     var out = String(r.stdout || '').trim();
                                     if (out.indexOf('SUCCESS') >= 0 && r.exit_code === 0) {
@@ -2346,6 +2356,7 @@ channelsPlugin._internals = {
     decodeUtf16: decodeUtf16,
     encodeUtf16Hex: encodeUtf16Hex,
     shQuote: shQuote,
+    wrapSh: wrapSh,
     sqlPath: sqlPath
 };
 
