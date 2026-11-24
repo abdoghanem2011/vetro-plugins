@@ -1162,7 +1162,7 @@
       <div class="modal-icon" style="background:rgba(59,130,246,0.15);border-color:rgba(59,130,246,0.3);color:var(--accent);">💾</div>
       <div class="modal-body">
         <h3 class="modal-title">Export Channel Backup</h3>
-        <p class="modal-text" style="margin-bottom:12px;">Your channel list has been packaged into the official Samsung <strong id="export-zip-name">Channel_list.zip</strong> archive (compatible with TV USB restore &amp; ChanSort).</p>
+        <p class="modal-text" style="margin-bottom:12px;">Your channel list has been packaged into the official Samsung <strong id="export-zip-name">Channel_list.zip</strong> archive (includes the TV's existing <code>metadata.xml</code> when present; compatible with USB restore &amp; ChanSort).</p>
         
         <p class="modal-text" style="font-size:12.5px;color:var(--amber);margin-bottom:8px;">⚠️ Because Vetro runs in a sandboxed frame, automatic downloads are restricted. Copy the link below and paste it into a new browser tab to download:</p>
         
@@ -1545,7 +1545,7 @@
 
     fetch('edit', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         action: action,
         dvbs: dvbsChannels,
@@ -1702,18 +1702,13 @@
            '</div>';
   }
 
-  function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
-
   // Tune Channel on TV (Instant direct srvId tune with high-speed key fallback)
   function tuneChannel(chNum, chName, srvId) {
     showToast('⏳ Tuning to #' + chNum + ' (' + chName + ')…', 2500);
 
     fetch('tune', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({ channel: chNum, srvId: srvId || undefined })
     })
     .then(function (res) { return res.json(); })
@@ -1818,7 +1813,7 @@
 
     fetch('edit', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         action: 'rename',
         channels: [targetNum],
@@ -2055,7 +2050,7 @@
 
     fetch('edit', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         action: 'move',
         channels: chNums,
@@ -2145,7 +2140,7 @@
   if (btnSwitchTv) {
     btnSwitchTv.addEventListener('click', function () {
       showToast('📺 Switching to TV Source…', 3000);
-      fetch('tvsource', { method: 'POST' })
+      fetch('tvsource', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' })
         .then(function (res) { return res.json(); })
         .then(function (data) {
           if (data.ok) showToast('📺 Switched to TV Source', 2000);
@@ -2327,7 +2322,7 @@
     showToast('🔄 Flushing TV channel manager…', 3000);
     if (btnReloadTv) btnReloadTv.classList.add('loading');
     if (btnStickyReload) btnStickyReload.classList.add('loading');
-    fetch('reload', { method: 'POST' })
+    fetch('reload', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' })
       .then(function (res) { return res.json(); })
       .then(function (data) {
         if (btnReloadTv) btnReloadTv.classList.remove('loading');
@@ -2357,7 +2352,7 @@
   function sendKey(keyName, cb) {
     fetch('key', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({ key: keyName })
     })
     .then(function (res) { return res.json(); })
