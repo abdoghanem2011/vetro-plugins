@@ -1912,6 +1912,7 @@ function channelsPlugin(ctx) {
                 withDbLock(res, function (release) {
                     var expId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
                     var tmpZipPath = path.join(tmpRoot, 'ch_exp_' + expId + '.zip');
+                    var ownerUg = getDirOwnerUg();
                     var exportCmd = wrapSh(
                         'PRD="/etc/prd_info.ini"; ' +
                         'VER=""; ' +
@@ -1928,6 +1929,7 @@ function channelsPlugin(ctx) {
                         'if [ -z "$FILES" ]; then echo "NO_FILES"; exit 2; fi; ' +
                         'rm -f "$ZIPPATH"; ' +
                         '/usr/bin/zip -j "$ZIPPATH" $FILES </dev/null >/dev/null 2>&1 || exit 3; ' +
+                        (ownerUg ? ('chown ' + shQuote(ownerUg) + ' "$ZIPPATH" 2>/dev/null && chmod 0600 "$ZIPPATH" 2>/dev/null || chmod 0644 "$ZIPPATH" 2>/dev/null || true; ') : 'chmod 0644 "$ZIPPATH" 2>/dev/null || true; ') +
                         'echo "$ZIPNAME"'
                     );
 

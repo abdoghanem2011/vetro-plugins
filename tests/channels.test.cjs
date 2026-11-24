@@ -1070,6 +1070,10 @@ test('CORS disabled, remote key allow-list hardened, export locked, reload avoid
     assert.match(expEntry.cmd, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
     assert.ok(expEntry.script.indexOf('5198920') < 0);
     assert.ok(expEntry.script.indexOf('DIGITAL_COUNTRY') < 0);
+    assert.ok(expEntry.script.indexOf('chmod 0600') >= 0 || expEntry.script.indexOf('chmod 0644') >= 0);
+    if (process.platform !== 'win32') {
+        assert.ok(expEntry.script.indexOf('chown ') >= 0);
+    }
 
     // B2 UI check & guideline hygiene: selections keyed by type:srvId, color-scheme meta, query preserved on export URL
     assert.ok(uiRes.body.indexOf('function getChannelKey(ch)') >= 0);
