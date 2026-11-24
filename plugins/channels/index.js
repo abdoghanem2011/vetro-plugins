@@ -19,6 +19,9 @@ var SRVID_RE = /^-?[0-9]+$/;
 var SAFE_IDENT_RE = /^[A-Za-z0-9_]+$/;
 var MAX_CHANNEL_NAME_LEN = 60;
 var CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+var MAX_IMPORT_BYTES = 15 * 1024 * 1024;
+var MAX_UNZIP_BYTES = 32 * 1024 * 1024;
+var MAX_UNZIP_ENTRIES = 50;
 
 // Note: Samsung Tizen firmware intentionally spells this systemd unit "tvs_deamon.service"
 // (verified on UA50AU7000 Tizen 6.0; "tvs_daemon.service" does not exist). Check both safely.
@@ -75,6 +78,265 @@ function rmrfSync(targetPath) {
             fs.unlinkSync(targetPath);
         }
     } catch (e) { /* ignore cleanup error */ }
+}
+
+function parseMetadataXml(xmlText) {
+    if (!xmlText || typeof xmlText !== 'string') return null;
+    var aMatch = /<ANALOG_COUNTRY>\s*([^<\s]+)\s*<\/ANALOG_COUNTRY>/i.exec(xmlText);
+    var dMatch = /<DIGITAL_COUNTRY>\s*([^<\s]+)\s*<\/DIGITAL_COUNTRY>/i.exec(xmlText);
+    var sMatch = /<SEI_VERSION>\s*([^<\s]+)\s*<\/SEI_VERSION>/i.exec(xmlText);
+    if (!aMatch && !dMatch && !sMatch) return null;
+    return {
+        analogCountry: aMatch ? aMatch[1].trim() : '',
+        digitalCountry: dMatch ? dMatch[1].trim() : '',
+        seiVersion: sMatch ? sMatch[1].trim() : ''
+    };
+}
+
+function parsePrdModel(prdText) {
+    if (!prdText || typeof prdText !== 'string') return '';
+    var lines = prdText.split(/\r?\n/);
+    var model = '';
+    var version = '';
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (/^Model=/i.test(line)) {
+            model = line.replace(/^Model=/i, '').replace(/;/g, '').trim();
+        } else if (/^Version=/i.test(line)) {
+            version = line.replace(/^Version=/i, '').replace(/;/g, '').trim();
+        }
+    }
+    if (model) return model;
+    if (version) {
+        return version.replace(/-[0-9]+(?:\.[0-9]+)*$/, '');
+    }
+    return '';
+}
+
+function extractZipModelPrefix(fileName) {
+    if (!fileName || typeof fileName !== 'string') return '';
+    var base = fileName.replace(/^.*[\/\\]/, '').replace(/\.zip$/i, '').trim();
+    if (!/^Channel_list_/i.test(base)) return '';
+    var rest = base.replace(/^Channel_list_/i, '').trim();
+    if (!rest || /^(backup|export|channels)$/i.test(rest)) return '';
+    var platMatch = /^([A-Za-z]-[A-Za-z0-9]{3,})(?:-[0-9].*)?$/i.exec(rest);
+    if (platMatch) return platMatch[1];
+    return rest.replace(/-[0-9]+(?:\.[0-9]+)*$/, '');
+}
+
+function sanitizeFileName(rawName) {
+    if (!rawName || typeof rawName !== 'string') return 'Channel_list.zip';
+    var base = rawName.replace(/^.*[\/\\]/, '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    if (!base) return 'Channel_list.zip';
+    if (base.length > 120) base = base.substr(0, 120);
+    return base;
+}
+
+// Parse `/usr/bin/unzip -l` output to enforce uncompressed size/count limits
+// and block path traversal before extracting only allowlisted files.
+function parseUnzipList(stdout) {
+    if (!stdout || typeof stdout !== 'string') {
+        return { error: 'Could not inspect archive contents.' };
+    }
+    var lines = stdout.split(/\r?\n/);
+    var entryCount = 0;
+    var totalBytes = 0;
+    var allowSet = createDict();
+    var dbFiles = [];
+    var extractFiles = [];
+    var entryRe = /^\s*(\d+)\s+\d{2,4}[-\/]\d{2}[-\/]\d{2,4}\s+\d{2}:\d{2}\s+(.+)$/;
+
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var m = entryRe.exec(line);
+        if (!m) continue;
+        var sz = parseInt(m[1], 10);
+        var name = String(m[2]).replace(/\r$/, '');
+        if (name.charAt(name.length - 1) === '/') {
+            continue;
+        }
+        entryCount++;
+        if (entryCount > MAX_UNZIP_ENTRIES) {
+            return { error: 'Archive contains too many entries (max ' + MAX_UNZIP_ENTRIES + ').' };
+        }
+        if (isNaN(sz) || sz < 0) {
+            return { error: 'Invalid entry size in archive.' };
+        }
+        totalBytes += sz;
+        if (totalBytes > MAX_UNZIP_BYTES) {
+            return { error: 'Decompressed archive exceeds 32 MB safety limit.' };
+        }
+        if (name.charAt(0) === '/' || name.indexOf('..') >= 0 || name.indexOf('\\') >= 0) {
+            return { error: 'Unsafe file path inside archive: ' + name };
+        }
+        if (ALLOWED_DBS.indexOf(name) >= 0) {
+            if (!hasOwn(allowSet, name)) {
+                allowSet[name] = true;
+                dbFiles.push(name);
+                extractFiles.push(name);
+            }
+        } else if (name === 'metadata.xml') {
+            if (!hasOwn(allowSet, name)) {
+                allowSet[name] = true;
+                extractFiles.push(name);
+            }
+        }
+    }
+
+    if (entryCount === 0) {
+        return { error: 'Could not inspect archive file listing.' };
+    }
+    if (dbFiles.length === 0) {
+        return { error: 'No channel databases (dvbs, ipsrv, dvbt, dvbc, sat) found inside archive.' };
+    }
+
+    return {
+        dbFiles: dbFiles,
+        extractFiles: extractFiles,
+        totalBytes: totalBytes,
+        entryCount: entryCount
+    };
+}
+
+function parseSchemaOutput(stdout) {
+    var out = {
+        integrity: '',
+        userVersion: 0,
+        tableNames: [],
+        tables: createDict(),
+        badTables: []
+    };
+    if (!stdout) return out;
+    var lines = String(stdout).split('\n');
+    var curTable = null;
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].replace(/\r/g, '').trim();
+        if (!line) continue;
+        if (line.indexOf('__INTEGRITY__=') === 0) {
+            out.integrity = line.substr('__INTEGRITY__='.length).trim();
+            curTable = null;
+        } else if (line.indexOf('__VERSION__=') === 0) {
+            out.userVersion = parseInt(line.substr('__VERSION__='.length).trim(), 10) || 0;
+            curTable = null;
+        } else if (line.indexOf('__BAD_TABLE__=') === 0) {
+            out.badTables.push(line.substr('__BAD_TABLE__='.length).trim());
+            curTable = null;
+        } else if (line.indexOf('__TABLE__=') === 0) {
+            curTable = line.substr('__TABLE__='.length).trim();
+            if (curTable) {
+                out.tableNames.push(curTable);
+                if (!out.tables[curTable]) out.tables[curTable] = [];
+            }
+        } else if (curTable) {
+            var parts = line.split('|');
+            if (parts.length >= 3) {
+                var colName = parts[1].trim();
+                var colType = parts[2].trim().toLowerCase();
+                out.tables[curTable].push(colName + ':' + colType);
+            }
+        }
+    }
+    return out;
+}
+
+function inspectDbSchema(ctx, dbPath) {
+    var qDb = shQuote(dbPath);
+    var cmd = 'sh -c ' + shQuote(
+        'DB=' + qDb + '; ' +
+        'if [ ! -f "$DB" ]; then echo "__MISSING__=1"; exit 2; fi; ' +
+        'RO=""; sqlite3 -readonly "$DB" "SELECT 1;" >/dev/null 2>&1 && RO="-readonly"; ' +
+        'INT=$(sqlite3 $RO "$DB" "PRAGMA integrity_check;" 2>/dev/null | tr "\\n" " "); ' +
+        'VER=$(sqlite3 $RO "$DB" "PRAGMA user_version;" 2>/dev/null || echo "0"); ' +
+        'echo "__INTEGRITY__=$INT"; ' +
+        'echo "__VERSION__=$VER"; ' +
+        'set -f; ' +
+        'sqlite3 $RO "$DB" "SELECT name FROM sqlite_master WHERE type=\'table\' AND name NOT LIKE \'sqlite_%\' ORDER BY name;" 2>/dev/null | ' +
+        'while IFS= read -r t; do ' +
+        '  [ -z "$t" ] && continue; ' +
+        '  case "$t" in ' +
+        '    *[!A-Za-z0-9_]*) echo "__BAD_TABLE__=$t" ;; ' +
+        '    *) echo "__TABLE__=$t"; sqlite3 $RO "$DB" "PRAGMA table_info($t);" 2>/dev/null ;; ' +
+        '  esac; ' +
+        'done'
+    );
+    return ctx.execute(cmd, 8000).then(function (r) {
+        if (r.exit_code !== 0 || (r.stdout || '').indexOf('__MISSING__=1') >= 0) {
+            return null;
+        }
+        return parseSchemaOutput(r.stdout);
+    });
+}
+
+function hasCol(cols, colName) {
+    var target = colName + ':';
+    for (var i = 0; i < cols.length; i++) {
+        if (cols[i].indexOf(target) === 0) return true;
+    }
+    return false;
+}
+
+function validateDbSchema(dbName, importedSchema, liveSchema) {
+    if (!importedSchema) {
+        return dbName + ': failed to inspect SQLite database';
+    }
+    if (importedSchema.integrity !== 'ok') {
+        return dbName + ': integrity_check failed (' + (importedSchema.integrity || 'unknown') + ')';
+    }
+    if (importedSchema.badTables.length > 0) {
+        return dbName + ': unsafe or unexpected table name (' + importedSchema.badTables.join(', ') + ')';
+    }
+    if (importedSchema.tableNames.length === 0) {
+        return dbName + ': SQLite database contains no tables';
+    }
+
+    if (liveSchema) {
+        var impTablesStr = importedSchema.tableNames.join(',');
+        var liveTablesStr = liveSchema.tableNames.join(',');
+        if (impTablesStr !== liveTablesStr) {
+            return dbName + ': table list mismatch (archive has [' + impTablesStr + '], TV expects [' + liveTablesStr + '])';
+        }
+        for (var i = 0; i < liveSchema.tableNames.length; i++) {
+            var tbl = liveSchema.tableNames[i];
+            var impCols = importedSchema.tables[tbl] || [];
+            var liveCols = liveSchema.tables[tbl] || [];
+            if (impCols.join(',') !== liveCols.join(',')) {
+                return dbName + ': schema mismatch in table "' + tbl + '"';
+            }
+        }
+        if (liveSchema.userVersion > 0 && importedSchema.userVersion !== liveSchema.userVersion) {
+            return dbName + ': database user_version mismatch (archive ' + importedSchema.userVersion + ' vs TV ' + liveSchema.userVersion + ')';
+        }
+        return null;
+    }
+
+    if (dbName === 'sat') {
+        if (!importedSchema.tables.SAT || !importedSchema.tables.SAT_TP) {
+            return dbName + ': missing required SAT/SAT_TP tables';
+        }
+        var satCols = importedSchema.tables.SAT;
+        var tpCols = importedSchema.tables.SAT_TP;
+        if (!hasCol(satCols, 'satId') || !hasCol(satCols, 'satName') ||
+            !hasCol(tpCols, 'tpId') || !hasCol(tpCols, 'satId') || !hasCol(tpCols, 'tpFreq')) {
+            return dbName + ': missing required SAT or SAT_TP columns';
+        }
+        return null;
+    }
+
+    if (!importedSchema.tables.SRV || !importedSchema.tables.CHNL) {
+        return dbName + ': missing required SRV or CHNL tables';
+    }
+    var reqSrv = ['srvId', 'chId', 'major', 'srvName', 'srvType', 'elim', 'hidden', 'hideGuide', 'numSel', 'modifiedByUser'];
+    var srvCols = importedSchema.tables.SRV;
+    for (var r = 0; r < reqSrv.length; r++) {
+        if (!hasCol(srvCols, reqSrv[r])) {
+            return dbName + ': SRV table missing required column "' + reqSrv[r] + '"';
+        }
+    }
+    var chnlCols = importedSchema.tables.CHNL;
+    if (!hasCol(chnlCols, 'chId') || !hasCol(chnlCols, 'chNum')) {
+        return dbName + ': CHNL table missing required columns';
+    }
+    return null;
 }
 
 function decodeUtf16(raw) {
@@ -486,15 +748,481 @@ ALLOWED_KEYS.XF86LowerChannel = 'XF86LowerChannel';
 ALLOWED_KEYS.exit = 'XF86Exit';
 ALLOWED_KEYS.XF86Exit = 'XF86Exit';
 
-module.exports = function (ctx) {
+function channelsPlugin(ctx) {
     var page = null;
     var cachedChannels = null;
     var lastFetchTime = 0;
     var dbBusy = false;
     var pendingReload = false;
+    var pendingImport = null;
     var dataDir = (ctx && ctx._dataDir) ? String(ctx._dataDir) : DEFAULT_DATA_DIR;
     var tmpRoot = (ctx && ctx._tmpDir) ? String(ctx._tmpDir) : DEFAULT_TMP_DIR;
     var lockFile = path.join(tmpRoot, 'vetro_channels_db.lock');
+    var backupDir = ctx && ctx.dir ? path.join(ctx.dir, 'backup') : null;
+    var preImportDir = backupDir ? path.join(backupDir, 'pre-import') : null;
+    var preEditDir = backupDir ? path.join(backupDir, 'pre-edit') : null;
+
+    function clearPendingImport() {
+        if (pendingImport && pendingImport.tmpDir) {
+            rmrfSync(pendingImport.tmpDir);
+        }
+        pendingImport = null;
+    }
+
+    function getDirOwnerUg() {
+        if (!ctx || !ctx.dir) return '';
+        try {
+            var st = fs.statSync(ctx.dir);
+            if (st && typeof st.uid === 'number' && typeof st.gid === 'number') {
+                return String(st.uid) + ':' + String(st.gid);
+            }
+        } catch (e) { /* ignore on platforms without posix uid/gid */ }
+        return '';
+    }
+
+    function readSlotStatus(slotDir, slotName) {
+        var result = {
+            available: false,
+            slot: slotName,
+            createdAt: null,
+            sourceName: null,
+            reason: null,
+            files: [],
+            model: null
+        };
+        if (!slotDir) return result;
+        try {
+            if (!fs.existsSync(slotDir)) return result;
+            var found = [];
+            for (var i = 0; i < ALLOWED_DBS.length; i++) {
+                var f = ALLOWED_DBS[i];
+                var p = path.join(slotDir, f);
+                try {
+                    if (fs.existsSync(p)) {
+                        var st = fs.lstatSync(p);
+                        if (st.isFile() && !st.isSymbolicLink()) {
+                            found.push(f);
+                        }
+                    }
+                } catch (e) { /* ignore stat error */ }
+            }
+            if (found.length === 0) return result;
+            result.available = true;
+            result.files = found;
+            var metaPath = path.join(slotDir, 'backup-meta.json');
+            if (fs.existsSync(metaPath)) {
+                try {
+                    var meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                    if (meta && typeof meta === 'object') {
+                        result.createdAt = meta.createdAt || null;
+                        result.sourceName = meta.sourceName || null;
+                        result.reason = meta.reason || null;
+                        result.model = meta.model || null;
+                    }
+                } catch (e) { /* ignore invalid meta */ }
+            }
+        } catch (e) { /* ignore */ }
+        return result;
+    }
+
+    function readBackupStatus() {
+        var preImport = readSlotStatus(preImportDir, 'pre-import');
+        if (!preImport.available && backupDir) {
+            var legacy = readSlotStatus(backupDir, 'pre-import');
+            if (legacy.available) {
+                legacy.legacy = true;
+                preImport = legacy;
+            }
+        }
+        var preEdit = readSlotStatus(preEditDir, 'pre-edit');
+
+        var latest = null;
+        if (preEdit.available && preImport.available) {
+            var tEdit = preEdit.createdAt ? Date.parse(preEdit.createdAt) : 0;
+            var tImport = preImport.createdAt ? Date.parse(preImport.createdAt) : 0;
+            latest = (!isNaN(tEdit) && !isNaN(tImport) && tEdit >= tImport) ? preEdit : preImport;
+        } else {
+            latest = preEdit.available ? preEdit : (preImport.available ? preImport : null);
+        }
+
+        return {
+            ok: true,
+            available: !!(preImport.available || preEdit.available),
+            preImport: preImport,
+            preEdit: preEdit,
+            latestSlot: latest ? latest.slot : null,
+            createdAt: latest ? latest.createdAt : null,
+            sourceName: latest ? latest.sourceName : null,
+            files: latest ? latest.files : [],
+            model: latest ? latest.model : null
+        };
+    }
+
+    // Create an online SQLite .backup snapshot of target DB(s) before delete or move.
+    // Leaves pre-import backup untouched in its separate slot.
+    function savePreEditBackup(targetDbNames, reason) {
+        if (!preEditDir || !targetDbNames || targetDbNames.length === 0) {
+            return Promise.resolve(false);
+        }
+        var dbList = [];
+        var seen = createDict();
+        for (var i = 0; i < targetDbNames.length; i++) {
+            var db = targetDbNames[i];
+            if (ALLOWED_DBS.indexOf(db) >= 0 && !hasOwn(seen, db)) {
+                seen[db] = true;
+                dbList.push(db);
+            }
+        }
+        if (dbList.length === 0) return Promise.resolve(false);
+
+        var id = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+        var metaTmp = path.join(tmpRoot, 'ch_ebak_' + id + '.json');
+        try {
+            fs.writeFileSync(metaTmp, JSON.stringify({
+                createdAt: new Date().toISOString(),
+                slot: 'pre-edit',
+                reason: String(reason || 'edit'),
+                files: dbList.slice()
+            }, null, 2), 'utf8');
+        } catch (metaErr) {
+            return Promise.reject(new Error('Failed to stage pre-edit backup metadata: ' + metaErr.message));
+        }
+
+        var ownerUg = getDirOwnerUg();
+        var fileArgs = '';
+        for (var j = 0; j < dbList.length; j++) {
+            fileArgs += (j > 0 ? ' ' : '') + shQuote(dbList[j]);
+        }
+
+        var script =
+            'DATA_DIR=' + shQuote(dataDir) + '; ' +
+            'BACKUP_BASE=' + shQuote(backupDir) + '; ' +
+            'SLOT_DIR=' + shQuote(preEditDir) + '; ' +
+            'NEW_DIR="${SLOT_DIR}.new"; ' +
+            'OLD_DIR="${SLOT_DIR}.old"; ' +
+            'META_TMP=' + shQuote(metaTmp) + '; ' +
+            'ANY_SRC=0; ' +
+            'for f in ' + fileArgs + '; do ' +
+            '  if [ -f "$DATA_DIR/$f" ]; then ANY_SRC=1; break; fi; ' +
+            'done; ' +
+            'if [ "$ANY_SRC" -eq 0 ]; then rm -f "$META_TMP"; echo "BACKUP_SKIP"; exit 0; fi; ' +
+            'mkdir -p "$BACKUP_BASE" || { rm -f "$META_TMP"; echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
+            'rm -rf "$NEW_DIR" "$OLD_DIR"; ' +
+            'mkdir -p "$NEW_DIR" || { rm -f "$META_TMP"; echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
+            'for f in ' + fileArgs + '; do ' +
+            '  if [ -f "$DATA_DIR/$f" ]; then ' +
+            '    BK_SQL=".backup \'"$(printf \'%s\' "$NEW_DIR/$f" | sed "s/\'/\'\'/g")"\'"; ' +
+            '    sqlite3 -bail "$DATA_DIR/$f" "$BK_SQL" >/dev/null 2>&1 || { rm -rf "$NEW_DIR" "$META_TMP"; echo "BACKUP_SQLITE_FAILED_$f"; exit 13; }; ' +
+            '  fi; ' +
+            'done; ' +
+            'cp "$META_TMP" "$NEW_DIR/backup-meta.json" || { rm -rf "$NEW_DIR" "$META_TMP"; echo "BACKUP_META_FAILED"; exit 13; }; ' +
+            'rm -f "$META_TMP"; ' +
+            (ownerUg ? ('chown -R ' + shQuote(ownerUg) + ' "$NEW_DIR" 2>/dev/null || true; ') : '') +
+            'chmod -R u+rwX,go+rX "$NEW_DIR" 2>/dev/null || true; ' +
+            'if [ -d "$SLOT_DIR" ]; then mv "$SLOT_DIR" "$OLD_DIR" || { rm -rf "$NEW_DIR"; echo "BACKUP_ROTATE_FAILED"; exit 13; }; fi; ' +
+            'mv "$NEW_DIR" "$SLOT_DIR" || { [ -d "$OLD_DIR" ] && mv "$OLD_DIR" "$SLOT_DIR" 2>/dev/null || true; rm -rf "$NEW_DIR"; echo "BACKUP_SWAP_FAILED"; exit 13; }; ' +
+            'rm -rf "$OLD_DIR"; ' +
+            'echo "BACKUP_OK"';
+
+        return ctx.execute('sh -c ' + shQuote(script), 15000).then(function (r) {
+            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
+            if (r.exit_code !== 0) {
+                return Promise.reject(new Error('Pre-edit backup failed (' + ((r.stdout || '').trim() || r.stderr || 'exit code ' + r.exit_code) + '); edit aborted to protect existing data.'));
+            }
+            return true;
+        }, function (err) {
+            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
+            return Promise.reject(err);
+        });
+    }
+
+    // Phase 1 of import: read-only validation while tvs_deamon.service keeps running.
+    // Validates zip integrity & uncompressed bounds (unzip -t / -l), extracts only allowlisted
+    // non-symlink entries, checks SQLite integrity & live TV schema match, and detects region/model mismatch.
+    function runPhase1Validation(uploadZip, tmpDir, sourceName) {
+        var listCmd = 'sh -c ' + shQuote(
+            'UP=' + shQuote(uploadZip) + '; ' +
+            'if ! /usr/bin/unzip -t "$UP" >/dev/null 2>&1; then rm -f "$UP"; echo "INVALID_ZIP"; exit 1; fi; ' +
+            'echo "__LIST_START__"; ' +
+            '/usr/bin/unzip -l "$UP"; ' +
+            'RC=$?; ' +
+            'echo "__LIST_END__"; ' +
+            'exit $RC'
+        );
+
+        return ctx.execute(listCmd, 12000).then(function (lr) {
+            var listOut = String(lr.stdout || '');
+            if (listOut.indexOf('INVALID_ZIP') >= 0 || lr.exit_code !== 0) {
+                try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                return { errorCode: 400, error: 'The uploaded file is not a valid zip archive.' };
+            }
+
+            var sList = listOut.indexOf('__LIST_START__');
+            var eList = listOut.indexOf('__LIST_END__', sList >= 0 ? sList + 14 : 0);
+            var listBody = (sList >= 0 && eList > sList) ? listOut.slice(sList + 14, eList) : listOut;
+            var parsedList = parseUnzipList(listBody);
+            if (parsedList.error) {
+                try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                return { errorCode: 400, error: parsedList.error };
+            }
+
+            var extractArgs = '';
+            for (var ei = 0; ei < parsedList.extractFiles.length; ei++) {
+                extractArgs += (ei > 0 ? ' ' : '') + shQuote(parsedList.extractFiles[ei]);
+            }
+            var ownerUg = getDirOwnerUg();
+            var extractCmd = 'sh -c ' + shQuote(
+                'UP=' + shQuote(uploadZip) + '; ' +
+                'TMP=' + shQuote(tmpDir) + '; ' +
+                'rm -rf "$TMP" && mkdir -p "$TMP" || { rm -f "$UP"; echo "EXTRACT_MKDIR_FAILED"; exit 1; }; ' +
+                '/usr/bin/unzip -o -q "$UP" ' + extractArgs + ' -d "$TMP/" >/dev/null 2>&1; RC=$?; rm -f "$UP"; ' +
+                'if [ $RC -ne 0 ]; then rm -rf "$TMP"; echo "INVALID_ZIP"; exit 1; fi; ' +
+                'TOTAL_SZ=0; DBS=""; ' +
+                'for f in ' + extractArgs + '; do ' +
+                '  if [ -L "$TMP/$f" ]; then rm -rf "$TMP"; echo "SYMLINK_REJECTED"; exit 4; fi; ' +
+                '  if [ -f "$TMP/$f" ]; then ' +
+                '    FSZ=$(wc -c < "$TMP/$f" 2>/dev/null || echo 0); ' +
+                '    TOTAL_SZ=$((TOTAL_SZ + FSZ)); ' +
+                '    case "$f" in metadata.xml) ;; *) DBS="$DBS $f" ;; esac; ' +
+                '  fi; ' +
+                'done; ' +
+                'if [ "$TOTAL_SZ" -gt ' + MAX_UNZIP_BYTES + ' ]; then rm -rf "$TMP"; echo "UNZIP_TOO_LARGE"; exit 5; fi; ' +
+                'if [ -z "$DBS" ]; then rm -rf "$TMP"; echo "NO_CHANNELS_FOUND"; exit 2; fi; ' +
+                (ownerUg ? ('chown -R ' + shQuote(ownerUg) + ' "$TMP" 2>/dev/null || true; ') : '') +
+                'chmod -R u+rwX "$TMP" 2>/dev/null || true; ' +
+                'echo "__DBS__=$DBS"; ' +
+                'if [ -f "$TMP/metadata.xml" ] && [ ! -L "$TMP/metadata.xml" ]; then echo "__IMP_META_START__"; cat "$TMP/metadata.xml"; echo ""; echo "__IMP_META_END__"; fi; ' +
+                'if [ -f ' + shQuote(path.join(dataDir, 'metadata.xml')) + ' ]; then echo "__TV_META_START__"; cat ' + shQuote(path.join(dataDir, 'metadata.xml')) + '; echo ""; echo "__TV_META_END__"; fi; ' +
+                'if [ -f "/etc/prd_info.ini" ]; then echo "__PRD_START__"; cat /etc/prd_info.ini; echo ""; echo "__PRD_END__"; fi'
+            );
+
+            return ctx.execute(extractCmd, 15000).then(function (r) {
+                var out = String(r.stdout || '');
+                if (out.indexOf('INVALID_ZIP') >= 0) {
+                    rmrfSync(tmpDir);
+                    return { errorCode: 400, error: 'The uploaded file is not a valid zip archive.' };
+                }
+                if (out.indexOf('SYMLINK_REJECTED') >= 0) {
+                    rmrfSync(tmpDir);
+                    return { errorCode: 400, error: 'Archive contains disallowed symbolic links.' };
+                }
+                if (out.indexOf('UNZIP_TOO_LARGE') >= 0) {
+                    rmrfSync(tmpDir);
+                    return { errorCode: 400, error: 'Extracted archive exceeds 32 MB safety limit.' };
+                }
+                if (out.indexOf('NO_CHANNELS_FOUND') >= 0) {
+                    rmrfSync(tmpDir);
+                    return { errorCode: 400, error: 'No channel databases (dvbs, ipsrv, dvbt, dvbc, sat) found inside archive.' };
+                }
+                if (r.exit_code !== 0) {
+                    rmrfSync(tmpDir);
+                    return { errorCode: 500, error: 'Failed to unpack archive: ' + (r.stderr || 'exit code ' + r.exit_code) };
+                }
+
+                var dbsMatch = /__DBS__=([^\r\n]+)/.exec(out);
+                var rawList = dbsMatch ? dbsMatch[1].trim().split(/\s+/) : [];
+                var dbFiles = [];
+                for (var i = 0; i < rawList.length; i++) {
+                    if (ALLOWED_DBS.indexOf(rawList[i]) >= 0) {
+                        dbFiles.push(rawList[i]);
+                    }
+                }
+                if (dbFiles.length === 0) {
+                    rmrfSync(tmpDir);
+                    return { errorCode: 400, error: 'No valid channel databases found inside archive.' };
+                }
+
+                function sliceBetween(startTag, endTag) {
+                    var sIdx = out.indexOf(startTag);
+                    if (sIdx < 0) return '';
+                    sIdx += startTag.length;
+                    var eIdx = out.indexOf(endTag, sIdx);
+                    if (eIdx < 0) return '';
+                    return out.slice(sIdx, eIdx).trim();
+                }
+
+                var impMeta = parseMetadataXml(sliceBetween('__IMP_META_START__', '__IMP_META_END__'));
+                var tvMeta = parseMetadataXml(sliceBetween('__TV_META_START__', '__TV_META_END__'));
+                var tvModel = parsePrdModel(sliceBetween('__PRD_START__', '__PRD_END__'));
+
+                var dbIdx = 0;
+                function validateNextDb() {
+                    if (dbIdx >= dbFiles.length) {
+                        var warnings = [];
+                        if (impMeta && tvMeta) {
+                            var diffs = [];
+                            if (tvMeta.digitalCountry && impMeta.digitalCountry && tvMeta.digitalCountry !== impMeta.digitalCountry) {
+                                diffs.push('Digital country ' + impMeta.digitalCountry + ' vs TV ' + tvMeta.digitalCountry);
+                            }
+                            if (tvMeta.analogCountry && impMeta.analogCountry && tvMeta.analogCountry !== impMeta.analogCountry) {
+                                diffs.push('Analog country ' + impMeta.analogCountry + ' vs TV ' + tvMeta.analogCountry);
+                            }
+                            if (tvMeta.seiVersion && impMeta.seiVersion && tvMeta.seiVersion !== impMeta.seiVersion) {
+                                diffs.push('SEI version ' + impMeta.seiVersion + ' vs TV ' + tvMeta.seiVersion);
+                            }
+                            if (diffs.length > 0) {
+                                warnings.push('Region/country metadata differs (' + diffs.join('; ') + '). The TV\'s existing metadata.xml will NOT be overwritten.');
+                            }
+                        }
+                        var zipModel = extractZipModelPrefix(sourceName);
+                        if (zipModel && tvModel && zipModel.toUpperCase() !== tvModel.toUpperCase()) {
+                            warnings.push('Archive filename suggests model "' + zipModel + '", which differs from this TV ("' + tvModel + '").');
+                        }
+                        return Promise.resolve({
+                            dbFiles: dbFiles,
+                            warnings: warnings,
+                            tvModel: tvModel
+                        });
+                    }
+
+                    var f = dbFiles[dbIdx++];
+                    var impPath = path.join(tmpDir, f);
+                    var livePath = path.join(dataDir, f);
+                    return inspectDbSchema(ctx, impPath).then(function (impSchema) {
+                        return inspectDbSchema(ctx, livePath).then(function (liveSchema) {
+                            var effectiveLive = (liveSchema && liveSchema.integrity === 'ok' && liveSchema.tableNames.length > 0) ? liveSchema : null;
+                            var errMsg = validateDbSchema(f, impSchema, effectiveLive);
+                            if (errMsg) {
+                                rmrfSync(tmpDir);
+                                return { errorCode: 400, error: 'Database schema validation failed: ' + errMsg };
+                            }
+                            return validateNextDb();
+                        });
+                    });
+                }
+
+                return validateNextDb();
+            });
+        }, function (err) {
+            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+            rmrfSync(tmpDir);
+            return { errorCode: 500, error: err.message };
+        });
+    }
+
+    // Phase 2 of import: atomic swap under flock + stopped tvs_deamon.service.
+    // EXIT trap cleans staged files and guarantees daemon restart even on error.
+    function runPhase2Swap(tmpDir, dbFiles, sourceName, tvModel) {
+        if (!preImportDir) {
+            rmrfSync(tmpDir);
+            return Promise.resolve({ errorCode: 500, error: 'Plugin directory unavailable for persistent backup.' });
+        }
+
+        var id = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+        var metaTmp = path.join(tmpRoot, 'ch_bmeta_' + id + '.json');
+        try {
+            fs.writeFileSync(metaTmp, JSON.stringify({
+                createdAt: new Date().toISOString(),
+                slot: 'pre-import',
+                reason: 'import',
+                sourceName: sanitizeFileName(sourceName),
+                files: dbFiles.slice(),
+                model: tvModel || ''
+            }, null, 2), 'utf8');
+        } catch (metaErr) {
+            rmrfSync(tmpDir);
+            return Promise.resolve({ errorCode: 500, error: 'Failed to prepare backup metadata: ' + metaErr.message });
+        }
+
+        var ownerUg = getDirOwnerUg();
+        var fileArgs = '';
+        for (var i = 0; i < dbFiles.length; i++) {
+            fileArgs += (i > 0 ? ' ' : '') + shQuote(dbFiles[i]);
+        }
+
+        var script =
+            'exec 9>' + shQuote(lockFile) + '; ' +
+            '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
+            TVS_UNIT_RESOLVE +
+            'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
+            'systemctl stop "$UNIT" >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
+            'DATA_DIR=' + shQuote(dataDir) + '; ' +
+            'TMP_DIR=' + shQuote(tmpDir) + '; ' +
+            'BACKUP_BASE=' + shQuote(backupDir) + '; ' +
+            'BACKUP_DIR=' + shQuote(preImportDir) + '; ' +
+            'BACKUP_NEW="${BACKUP_DIR}.new"; ' +
+            'BACKUP_OLD="${BACKUP_DIR}.old"; ' +
+            'META_TMP=' + shQuote(metaTmp) + '; ' +
+            'RESTARTED=0; ' +
+            'cleanup_on_exit() { ' +
+            '  rm -rf "$TMP_DIR" "$META_TMP" 2>/dev/null || true; ' +
+            '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
+            '}; ' +
+            'trap cleanup_on_exit EXIT; ' +
+            'for f in dvbs sat ipsrv dvbt dvbc; do ' +
+            '  if [ -f "$DATA_DIR/$f" ]; then sqlite3 "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; fi; ' +
+            'done; ' +
+            'mkdir -p "$BACKUP_BASE" || { echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
+            'rm -rf "$BACKUP_NEW" "$BACKUP_OLD"; ' +
+            'mkdir -p "$BACKUP_NEW" || { echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
+            'for f in dvbs sat ipsrv dvbt dvbc; do ' +
+            '  if [ -f "$DATA_DIR/$f" ]; then ' +
+            '    cp -p "$DATA_DIR/$f" "$BACKUP_NEW/$f" || { rm -rf "$BACKUP_NEW"; echo "BACKUP_COPY_FAILED"; exit 13; }; ' +
+            '  fi; ' +
+            'done; ' +
+            'cp "$META_TMP" "$BACKUP_NEW/backup-meta.json" || { rm -rf "$BACKUP_NEW"; echo "BACKUP_META_FAILED"; exit 13; }; ' +
+            (ownerUg ? ('chown -R ' + shQuote(ownerUg) + ' "$BACKUP_NEW" 2>/dev/null || true; ') : '') +
+            'chmod -R u+rwX,go+rX "$BACKUP_NEW" 2>/dev/null || true; ' +
+            'if [ -d "$BACKUP_DIR" ]; then mv "$BACKUP_DIR" "$BACKUP_OLD" || { rm -rf "$BACKUP_NEW"; echo "BACKUP_ROTATE_FAILED"; exit 13; }; fi; ' +
+            'mv "$BACKUP_NEW" "$BACKUP_DIR" || { [ -d "$BACKUP_OLD" ] && mv "$BACKUP_OLD" "$BACKUP_DIR" 2>/dev/null || true; rm -rf "$BACKUP_NEW"; echo "BACKUP_SWAP_FAILED"; exit 13; }; ' +
+            'rm -rf "$BACKUP_OLD"; ' +
+            'rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
+            'COPY_ERR=0; ' +
+            'for f in ' + fileArgs + '; do ' +
+            '  cp "$TMP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || { COPY_ERR=1; break; }; ' +
+            'done; ' +
+            'if [ "$COPY_ERR" -ne 0 ]; then ' +
+            '  rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
+            '  for f in dvbs sat ipsrv dvbt dvbc; do ' +
+            '    if [ -f "$BACKUP_DIR/$f" ]; then cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || true; fi; ' +
+            '  done; ' +
+            '  for f in ' + fileArgs + '; do ' +
+            '    if [ ! -f "$BACKUP_DIR/$f" ]; then rm -f "$DATA_DIR/$f"; fi; ' +
+            '  done; ' +
+            '  echo "COPY_ROLLED_BACK"; exit 14; ' +
+            'fi; ' +
+            'for f in ' + fileArgs + '; do ' +
+            '  [ -f "$DATA_DIR/$f" ] && sqlite3 "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; ' +
+            'done; ' +
+            'systemctl start "$UNIT" >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
+            'RESTARTED=1; ' +
+            'sleep 1; ' +
+            'echo "SUCCESS"';
+
+        return ctx.execute('sh -c ' + shQuote(script), 30000).then(function (r) {
+            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
+            rmrfSync(tmpDir);
+            var out = String(r.stdout || '').trim();
+            if (out.indexOf('SUCCESS') >= 0 && r.exit_code === 0) {
+                cachedChannels = null;
+                pendingReload = false;
+                return {
+                    ok: true,
+                    message: 'Channels imported and TV channel manager reloaded! Previous list saved for rollback.'
+                };
+            }
+            if (out.indexOf('LOCKED') >= 0) {
+                return { errorCode: 409, error: 'Database lock held by another operation. Please retry in a few seconds.' };
+            }
+            if (out.indexOf('NO_TVS_UNIT') >= 0 || out.indexOf('STOP_FAILED') >= 0) {
+                return { errorCode: 500, error: 'Could not stop tvs_deamon.service safely before import; live TV databases were left untouched.' };
+            }
+            if (out.indexOf('BACKUP_') >= 0) {
+                return { errorCode: 500, error: 'Failed to create persistent pre-import backup (' + out + '); live TV databases were left untouched.' };
+            }
+            if (out.indexOf('COPY_ROLLED_BACK') >= 0) {
+                return { errorCode: 500, error: 'Failed while copying database files; previous channel list was rolled back inside the stopped-daemon transaction.' };
+            }
+            return { errorCode: 500, error: 'Import swap failed (' + (out || r.stderr || 'exit code ' + r.exit_code) + ').' };
+        }, function (err) {
+            // Do NOT delete tmpDir/metaTmp or spawn a competing restore script after timeout;
+            // the running shell script's EXIT trap owns cleanup and backup/pre-import stays intact.
+            return {
+                errorCode: 500,
+                error: 'Import command timed out or failed (' + err.message + '). Refresh the list or use "Restore Previous" if needed.'
+            };
+        });
+    }
 
     function withDbLock(res, actionFn) {
         if (dbBusy) {
@@ -643,6 +1371,7 @@ module.exports = function (ctx) {
         },
 
         stop: function () {
+            clearPendingImport();
             page = null;
             cachedChannels = null;
             lastFetchTime = 0;
@@ -666,6 +1395,12 @@ module.exports = function (ctx) {
                 if (!page) page = loadPage(ctx);
                 res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
                 res.end(page || '');
+                return true;
+            }
+
+            // GET api/backup-status — check whether pre-import or pre-edit backups exist
+            if (action === 'backup-status' && req.method === 'GET') {
+                sendJson(res, 200, readBackupStatus());
                 return true;
             }
 
@@ -944,16 +1679,22 @@ module.exports = function (ctx) {
                                     sqlParts.push('PRAGMA wal_checkpoint(TRUNCATE);');
                                 }
 
-                                return runSqlFile(ctx, tmpRoot, targetExecDb, sqlParts, 'ch_del_', 15000).then(function () {
-                                    release();
-                                    cachedChannels = null;
-                                    pendingReload = true;
-                                    sendJson(res, 200, {
-                                        ok: true,
-                                        action: 'delete',
-                                        deleted: totalDeleted,
-                                        shifted: totalShifted,
-                                        pendingReload: pendingReload
+                                var bakTargets = [];
+                                if (dvbsPlan.toDelete.length > 0) bakTargets.push('dvbs');
+                                if (ipPlan.toDelete.length > 0) bakTargets.push('ipsrv');
+
+                                return savePreEditBackup(bakTargets, 'delete (' + totalDeleted + ' channel(s))').then(function () {
+                                    return runSqlFile(ctx, tmpRoot, targetExecDb, sqlParts, 'ch_del_', 15000).then(function () {
+                                        release();
+                                        cachedChannels = null;
+                                        pendingReload = true;
+                                        sendJson(res, 200, {
+                                            ok: true,
+                                            action: 'delete',
+                                            deleted: totalDeleted,
+                                            shifted: totalShifted,
+                                            pendingReload: pendingReload
+                                        });
                                     });
                                 });
                             }).then(null, function (delErr) {
@@ -1014,18 +1755,20 @@ module.exports = function (ctx) {
                                         'PRAGMA wal_checkpoint(TRUNCATE);'
                                     ];
 
-                                    return runSqlFile(ctx, tmpRoot, moveDbPath, moveParts, 'ch_mv_', 15000).then(function () {
-                                        release();
-                                        cachedChannels = null;
-                                        pendingReload = true;
-                                        sendJson(res, 200, {
-                                            ok: true,
-                                            action: 'move',
-                                            target: target,
-                                            moved: moveSrvIds.length,
-                                            changed: changes.length,
-                                            changes: changes,
-                                            pendingReload: pendingReload
+                                    return savePreEditBackup([targetType], 'move (' + moveSrvIds.length + ' channel(s) to #' + target + ')').then(function () {
+                                        return runSqlFile(ctx, tmpRoot, moveDbPath, moveParts, 'ch_mv_', 15000).then(function () {
+                                            release();
+                                            cachedChannels = null;
+                                            pendingReload = true;
+                                            sendJson(res, 200, {
+                                                ok: true,
+                                                action: 'move',
+                                                target: target,
+                                                moved: moveSrvIds.length,
+                                                changed: changes.length,
+                                                changes: changes,
+                                                pendingReload: pendingReload
+                                            });
                                         });
                                     });
                                 })
@@ -1215,116 +1958,303 @@ module.exports = function (ctx) {
                 return true;
             }
 
-            // POST api/import — import Samsung Channel_list_*.zip archive
+            // POST api/import — import Samsung Channel_list_*.zip archive (two-phase safe import)
             if ((sub === 'import' || action === 'import') && req.method === 'POST') {
                 withDbLock(res, function (release) {
-                    var importId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
-                    var uploadZip = '/tmp/ch_up_' + importId + '.zip';
-                    var tmpDir = '/tmp/ch_imp_' + importId;
-                    var bakDir = '/tmp/ch_bak_' + importId;
+                    var contentLen = parseInt(req.headers && req.headers['content-length'], 10);
+                    if (!isNaN(contentLen) && contentLen > MAX_IMPORT_BYTES) {
+                        release();
+                        sendJson(res, 413, { ok: false, error: 'Archive exceeds 15 MB limit.' });
+                        return;
+                    }
 
-                    var MAX_IMPORT_BYTES = 15 * 1024 * 1024; // 15 MB cap
+                    var rawHeaderName = req.headers && req.headers['x-upload-filename'] ? String(req.headers['x-upload-filename']) : '';
+                    var decodedHeaderName = rawHeaderName;
+                    if (rawHeaderName) {
+                        try { decodedHeaderName = decodeURIComponent(rawHeaderName); } catch (e) { decodedHeaderName = rawHeaderName; }
+                    }
+                    var sourceName = sanitizeFileName(decodedHeaderName);
+                    var importId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+                    var uploadZip = path.join(tmpRoot, 'ch_up_' + importId + '.zip');
+                    var tmpDir = path.join(tmpRoot, 'ch_imp_' + importId);
+
                     var receivedBytes = 0;
                     var outStream = fs.createWriteStream(uploadZip);
-                    var exceeded = false;
+                    var outClosed = false;
+                    var uploadEnded = false;
+                    var settled = false;
+
+                    outStream.once('close', function () {
+                        outClosed = true;
+                    });
+
+                    function abortUpload(statusCode, errMsg, destroyReqAfterRes) {
+                        if (settled) return;
+                        settled = true;
+
+                        if (typeof req.unpipe === 'function') {
+                            try { req.unpipe(outStream); } catch (e) {}
+                        }
+
+                        function finalizeCleanup() {
+                            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                            release();
+                            if (destroyReqAfterRes && typeof req.destroy === 'function') {
+                                if (res.writableEnded || res.finished) {
+                                    try { req.destroy(); } catch (e) {}
+                                } else {
+                                    res.once('finish', function () {
+                                        try { req.destroy(); } catch (e) {}
+                                    });
+                                }
+                            }
+                            if (!res.headersSent) {
+                                sendJson(res, statusCode, { ok: false, error: errMsg });
+                            }
+                        }
+
+                        if (outClosed) {
+                            finalizeCleanup();
+                        } else {
+                            outStream.once('close', finalizeCleanup);
+                            if (typeof outStream.destroy === 'function') {
+                                try { outStream.destroy(); } catch (e) { finalizeCleanup(); }
+                            } else if (typeof outStream.end === 'function') {
+                                try { outStream.end(); } catch (e) { finalizeCleanup(); }
+                            } else {
+                                finalizeCleanup();
+                            }
+                        }
+                    }
 
                     req.on('data', function (chunk) {
+                        if (settled) return;
                         receivedBytes += chunk.length;
                         if (receivedBytes > MAX_IMPORT_BYTES) {
-                            exceeded = true;
-                            req.destroy();
-                            outStream.destroy();
-                            try { fs.unlinkSync(uploadZip); } catch (e) {}
+                            abortUpload(413, 'Archive exceeds 15 MB limit.', true);
                         }
                     });
 
-                    req.pipe(outStream);
+                    req.on('end', function () {
+                        uploadEnded = true;
+                    });
 
-                    outStream.on('finish', function () {
-                        if (exceeded) {
-                            release();
-                            res.writeHead(413, { 'content-type': 'application/json' });
-                            res.end(JSON.stringify({ ok: false, error: 'Archive exceeds 15 MB limit.' }));
-                            return;
+                    req.on('aborted', function () {
+                        abortUpload(400, 'Upload aborted by client.', false);
+                    });
+
+                    req.on('close', function () {
+                        if (!uploadEnded && !settled) {
+                            abortUpload(400, 'Upload connection closed before completion.', false);
                         }
+                    });
 
-                        var importCmd = 'sh -c \'' +
-                            'if ! /usr/bin/unzip -t "' + uploadZip + '" >/dev/null 2>&1; then ' +
-                            '  rm -f "' + uploadZip + '"; echo "INVALID_ZIP"; exit 1; ' +
-                            'fi; ' +
-                            'rm -rf "' + tmpDir + '" && mkdir -p "' + tmpDir + '"; ' +
-                            '/usr/bin/unzip -o -q "' + uploadZip + '" -d "' + tmpDir + '/"; ' +
-                            'FOUND=0; ' +
-                            'for f in dvbs sat ipsrv dvbt dvbc; do ' +
-                            '  if [ -f "' + tmpDir + '/$f" ]; then FOUND=1; break; fi; ' +
-                            'done; ' +
-                            'if [ $FOUND -eq 0 ]; then ' +
-                            '  rm -rf "' + tmpDir + '" "' + uploadZip + '"; echo "NO_CHANNELS_FOUND"; exit 2; ' +
-                            'fi; ' +
-                            'for f in dvbs sat ipsrv dvbt dvbc; do ' +
-                            '  if [ -f "' + tmpDir + '/$f" ]; then ' +
-                            '    CHK=$(sqlite3 "' + tmpDir + '/$f" "PRAGMA integrity_check;" 2>/dev/null || echo "corrupt"); ' +
-                            '    if [ "$CHK" != "ok" ]; then ' +
-                            '      rm -rf "' + tmpDir + '" "' + uploadZip + '"; echo "CORRUPT_DB_$f"; exit 3; ' +
-                            '    fi; ' +
-                            '  fi; ' +
-                            'done; ' +
-                            'rm -rf "' + bakDir + '" && mkdir -p "' + bakDir + '"; ' +
-                            'cp /mnt/systemrw/tvs-chms/data/* "' + bakDir + '/" 2>/dev/null || true; ' +
-                            'rm -f /mnt/systemrw/tvs-chms/data/*-wal /mnt/systemrw/tvs-chms/data/*-shm; ' +
-                            'for f in dvbs sat ipsrv dvbt dvbc metadata.xml; do ' +
-                            '  if [ -f "' + tmpDir + '/$f" ]; then ' +
-                            '    cp "' + tmpDir + '/$f" "/mnt/systemrw/tvs-chms/data/$f"; ' +
-                            '  fi; ' +
-                            'done; ' +
-                            '[ -f /mnt/systemrw/tvs-chms/data/dvbs ] && sqlite3 /mnt/systemrw/tvs-chms/data/dvbs "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true; ' +
-                            '[ -f /mnt/systemrw/tvs-chms/data/ipsrv ] && sqlite3 /mnt/systemrw/tvs-chms/data/ipsrv "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true; ' +
-                            '(systemctl restart tvs_deamon.service || pkill -9 tvs-daemon || true); sleep 1; ' +
-                            '(/usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user >/dev/null 2>&1 || true); ' +
-                            'rm -rf "' + tmpDir + '" "' + bakDir + '" "' + uploadZip + '"; ' +
-                            'echo "SUCCESS"\';';
-
-                        ctx.execute(importCmd, 20000).then(function (r) {
-                            release();
-                            cachedChannels = null;
-                            var out = (r.stdout || '').trim();
-                            if (out.indexOf('INVALID_ZIP') >= 0) {
-                                res.writeHead(400, { 'content-type': 'application/json' });
-                                res.end(JSON.stringify({ ok: false, error: 'The uploaded file is not a valid zip archive.' }));
-                                return;
-                            }
-                            if (out.indexOf('NO_CHANNELS_FOUND') >= 0) {
-                                res.writeHead(400, { 'content-type': 'application/json' });
-                                res.end(JSON.stringify({ ok: false, error: 'No channel databases (dvbs, ipsrv, dvbt) found inside archive.' }));
-                                return;
-                            }
-                            if (out.indexOf('CORRUPT_DB_') >= 0) {
-                                res.writeHead(400, { 'content-type': 'application/json' });
-                                res.end(JSON.stringify({ ok: false, error: 'Database integrity check failed: corrupt SQLite database in zip.' }));
-                                return;
-                            }
-                            if (r.exit_code !== 0) {
-                                // Restore backup on error
-                                ctx.execute('sh -c "if [ -d \\"' + bakDir + '\\" ]; then cp \\"' + bakDir + '\\"/* /mnt/systemrw/tvs-chms/data/ 2>/dev/null || true; fi; rm -rf \\"' + tmpDir + '\\" \\"' + bakDir + '\\" \\"' + uploadZip + '\\";"', 10000);
-                                res.writeHead(500, { 'content-type': 'application/json' });
-                                res.end(JSON.stringify({ ok: false, error: 'Import failed: ' + (r.stderr || 'exit code ' + r.exit_code) }));
-                                return;
-                            }
-                            res.writeHead(200, { 'content-type': 'application/json' });
-                            res.end(JSON.stringify({ ok: true, message: 'Channels imported successfully and TV tuner reloaded!' }));
-                        }, function (e) {
-                            ctx.execute('sh -c "if [ -d \\"' + bakDir + '\\" ]; then cp \\"' + bakDir + '\\"/* /mnt/systemrw/tvs-chms/data/ 2>/dev/null || true; fi; rm -rf \\"' + tmpDir + '\\" \\"' + bakDir + '\\" \\"' + uploadZip + '\\";"', 10000);
-                            release();
-                            res.writeHead(500, { 'content-type': 'application/json' });
-                            res.end(JSON.stringify({ ok: false, error: e.message }));
-                        });
+                    req.on('error', function (err) {
+                        abortUpload(400, 'Upload failed: ' + err.message, false);
                     });
 
                     outStream.on('error', function (err) {
-                        try { fs.unlinkSync(uploadZip); } catch (e) {}
-                        release();
-                        res.writeHead(500, { 'content-type': 'application/json' });
-                        res.end(JSON.stringify({ ok: false, error: err.message }));
+                        abortUpload(500, 'Failed writing upload stream: ' + err.message, true);
+                    });
+
+                    outStream.on('finish', function () {
+                        if (settled) return;
+                        settled = true;
+
+                        runPhase1Validation(uploadZip, tmpDir, sourceName).then(function (p1) {
+                            if (p1.error) {
+                                release();
+                                sendJson(res, p1.errorCode || 400, { ok: false, error: p1.error });
+                                return;
+                            }
+
+                            if (p1.warnings && p1.warnings.length > 0) {
+                                clearPendingImport();
+                                var confirmToken = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 8);
+                                pendingImport = {
+                                    token: confirmToken,
+                                    tmpDir: tmpDir,
+                                    dbFiles: p1.dbFiles,
+                                    sourceName: sourceName,
+                                    tvModel: p1.tvModel
+                                };
+                                release();
+                                sendJson(res, 200, {
+                                    ok: true,
+                                    needsConfirm: true,
+                                    confirmToken: confirmToken,
+                                    warnings: p1.warnings,
+                                    files: p1.dbFiles
+                                });
+                                return;
+                            }
+
+                            return runPhase2Swap(tmpDir, p1.dbFiles, sourceName, p1.tvModel).then(function (p2) {
+                                release();
+                                if (p2.ok) {
+                                    sendJson(res, 200, p2);
+                                } else {
+                                    sendJson(res, p2.errorCode || 500, { ok: false, error: p2.error });
+                                }
+                            });
+                        }, function (err) {
+                            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                            rmrfSync(tmpDir);
+                            release();
+                            sendJson(res, 500, { ok: false, error: err.message });
+                        });
+                    });
+
+                    req.pipe(outStream);
+                });
+                return true;
+            }
+
+            // POST api/import-confirm — complete staged Phase 2 swap after explicit user confirmation
+            if (action === 'import-confirm' && req.method === 'POST') {
+                readJson(req, 4096, function (err, parsed) {
+                    if (err) {
+                        sendJson(res, 400, { ok: false, error: err.message });
+                        return;
+                    }
+                    withDbLock(res, function (release) {
+                        var tok = parsed.confirmToken ? String(parsed.confirmToken) : '';
+                        if (!pendingImport || !tok || pendingImport.token !== tok) {
+                            release();
+                            sendJson(res, 400, { ok: false, error: 'No matching pending import found. Please upload the archive again.' });
+                            return;
+                        }
+                        var staged = pendingImport;
+                        pendingImport = null;
+
+                        runPhase2Swap(staged.tmpDir, staged.dbFiles, staged.sourceName, staged.tvModel).then(function (p2) {
+                            release();
+                            if (p2.ok) {
+                                sendJson(res, 200, p2);
+                            } else {
+                                sendJson(res, p2.errorCode || 500, { ok: false, error: p2.error });
+                            }
+                        }, function (swapErr) {
+                            release();
+                            sendJson(res, 500, { ok: false, error: swapErr.message });
+                        });
+                    });
+                });
+                return true;
+            }
+
+            // POST api/import-cancel — discard a staged mismatch import without stopping the TV daemon
+            if (action === 'import-cancel' && req.method === 'POST') {
+                readJson(req, 4096, function (err, parsed) {
+                    var tok = (!err && parsed && parsed.confirmToken) ? String(parsed.confirmToken) : '';
+                    if (!tok || (pendingImport && pendingImport.token === tok)) {
+                        clearPendingImport();
+                    }
+                    sendJson(res, 200, { ok: true });
+                });
+                return true;
+            }
+
+            // POST api/restore-backup — restore pre-edit or pre-import backup under stopped daemon
+            if (action === 'restore-backup' && req.method === 'POST') {
+                readJson(req, 4096, function (bodyErr, parsedBody) {
+                    var requestedSlot = (!bodyErr && parsedBody && parsedBody.slot) ? String(parsedBody.slot).trim() : '';
+                    if (requestedSlot && requestedSlot !== 'pre-import' && requestedSlot !== 'pre-edit') {
+                        sendJson(res, 400, { ok: false, error: 'Invalid backup slot. Expected "pre-import" or "pre-edit".' });
+                        return;
+                    }
+
+                    withDbLock(res, function (release) {
+                        var bStatus = readBackupStatus();
+                        var chosenSlot = requestedSlot;
+                        if (!chosenSlot) {
+                            chosenSlot = bStatus.preImport.available ? 'pre-import' : (bStatus.preEdit.available ? 'pre-edit' : '');
+                        }
+                        var slotInfo = chosenSlot === 'pre-edit' ? bStatus.preEdit : bStatus.preImport;
+                        var slotDir = chosenSlot === 'pre-edit'
+                            ? preEditDir
+                            : ((bStatus.preImport && bStatus.preImport.legacy) ? backupDir : preImportDir);
+
+                        if (!slotInfo || !slotInfo.available || slotInfo.files.length === 0) {
+                            release();
+                            sendJson(res, 404, { ok: false, error: 'Requested backup (' + (chosenSlot || 'any') + ') is not available on the TV.' });
+                            return;
+                        }
+
+                        var files = slotInfo.files;
+                        var idx = 0;
+                        function verifyNextBackupDb() {
+                            if (idx >= files.length) {
+                                var fileArgs = '';
+                                for (var fi = 0; fi < files.length; fi++) {
+                                    fileArgs += (fi > 0 ? ' ' : '') + shQuote(files[fi]);
+                                }
+                                var restoreScript =
+                                    'exec 9>' + shQuote(lockFile) + '; ' +
+                                    '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
+                                    TVS_UNIT_RESOLVE +
+                                    'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
+                                    'systemctl stop "$UNIT" >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
+                                    'RESTARTED=0; ' +
+                                    'cleanup_start() { ' +
+                                    '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
+                                    '}; ' +
+                                    'trap cleanup_start EXIT; ' +
+                                    'DATA_DIR=' + shQuote(dataDir) + '; ' +
+                                    'BACKUP_DIR=' + shQuote(slotDir) + '; ' +
+                                    'rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
+                                    'for f in ' + fileArgs + '; do ' +
+                                    '  cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || { echo "RESTORE_COPY_FAILED"; exit 14; }; ' +
+                                    '  sqlite3 -bail "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; ' +
+                                    'done; ' +
+                                    'systemctl start "$UNIT" >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
+                                    'RESTARTED=1; ' +
+                                    'sleep 1; ' +
+                                    'echo "SUCCESS"';
+
+                                return ctx.execute('sh -c ' + shQuote(restoreScript), 25000).then(function (r) {
+                                    release();
+                                    var out = String(r.stdout || '').trim();
+                                    if (out.indexOf('SUCCESS') >= 0 && r.exit_code === 0) {
+                                        cachedChannels = null;
+                                        pendingReload = false;
+                                        sendJson(res, 200, {
+                                            ok: true,
+                                            slot: chosenSlot,
+                                            restored: files,
+                                            message: 'Backup (' + chosenSlot + ') restored and TV channel manager reloaded!'
+                                        });
+                                        return;
+                                    }
+                                    if (out.indexOf('LOCKED') >= 0) {
+                                        sendJson(res, 409, { ok: false, error: 'Database lock held by another operation. Please retry in a few seconds.' });
+                                        return;
+                                    }
+                                    sendJson(res, 500, { ok: false, error: 'Restore failed (' + (out || r.stderr || 'exit code ' + r.exit_code) + ').' });
+                                }, function (err) {
+                                    release();
+                                    sendJson(res, 500, { ok: false, error: err.message });
+                                });
+                            }
+
+                            var f = files[idx++];
+                            var bPath = path.join(slotDir, f);
+                            return inspectDbSchema(ctx, bPath).then(function (bakSchema) {
+                                // Validate against required baseline schema (null liveSchema) so a corrupt live DB never blocks restore
+                                var schemaErr = validateDbSchema(f, bakSchema, null);
+                                if (schemaErr) {
+                                    release();
+                                    sendJson(res, 500, { ok: false, error: 'Saved backup failed validation: ' + schemaErr });
+                                    return;
+                                }
+                                return verifyNextBackupDb();
+                            });
+                        }
+
+                        verifyNextBackupDb().then(null, function (vErr) {
+                            release();
+                            sendJson(res, 500, { ok: false, error: vErr.message });
+                        });
                     });
                 });
                 return true;
@@ -1333,4 +2263,31 @@ module.exports = function (ctx) {
             return false;
         }
     };
+}
+
+channelsPlugin._internals = {
+    ALLOWED_KEYS: ALLOWED_KEYS,
+    ALLOWED_DBS: ALLOWED_DBS,
+    MAX_IMPORT_BYTES: MAX_IMPORT_BYTES,
+    MAX_UNZIP_BYTES: MAX_UNZIP_BYTES,
+    MAX_UNZIP_ENTRIES: MAX_UNZIP_ENTRIES,
+    MAX_CHANNEL_NAME_LEN: MAX_CHANNEL_NAME_LEN,
+    getServiceCategory: getServiceCategory,
+    parseMetadataXml: parseMetadataXml,
+    parsePrdModel: parsePrdModel,
+    extractZipModelPrefix: extractZipModelPrefix,
+    sanitizeFileName: sanitizeFileName,
+    parseUnzipList: parseUnzipList,
+    parseSchemaOutput: parseSchemaOutput,
+    inspectDbSchema: inspectDbSchema,
+    validateDbSchema: validateDbSchema,
+    parseSrvIdList: parseSrvIdList,
+    planDeleteAndCompact: planDeleteAndCompact,
+    computeChannelMoves: computeChannelMoves,
+    decodeUtf16: decodeUtf16,
+    encodeUtf16Hex: encodeUtf16Hex,
+    shQuote: shQuote,
+    sqlPath: sqlPath
 };
+
+module.exports = channelsPlugin;

@@ -802,6 +802,15 @@
     background: rgba(148, 163, 184, 0.12);
   }
 
+  .modal-warnings-list {
+    margin: 10px 0 0 18px;
+    font-size: 12.5px;
+    color: #fcd34d;
+    line-height: 1.45;
+  }
+  .modal-warnings-list li {
+    margin-bottom: 4px;
+  }
   .modal-checkbox-row {
     display: none;
     align-items: flex-start;
@@ -821,6 +830,25 @@
     margin-top: 2px;
     flex-shrink: 0;
     accent-color: var(--accent);
+  }
+  .restore-slot-card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-s);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .restore-slot-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .restore-slot-meta {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.4;
   }
 
   /* Floating Toast */
@@ -1133,6 +1161,7 @@
         <button type="button" class="btn-restore" id="btn-reload-tv" title="Apply all changes and reload TV tuner">🔄 Reload TV</button>
         <button type="button" class="btn-restore" id="btn-export-bak" title="Export channel list as official Samsung Channel_list_*.zip (USB & ChanSort compatible)">💾 Export Backup</button>
         <button type="button" class="btn-restore" id="btn-import-bak" title="Import channel list from Samsung Channel_list_*.zip">📥 Import Backup</button>
+        <button type="button" class="btn-restore" id="btn-restore-prev" style="display:none;" title="Restore saved pre-edit or pre-import backup">↩️ Restore Previous</button>
         <input type="file" id="file-import-input" accept=".zip,application/zip" style="display:none;">
       </div>
     </div>
@@ -1204,6 +1233,7 @@
       <div class="modal-body">
         <h3 class="modal-title" id="modal-title">Confirm Action</h3>
         <p class="modal-text" id="modal-msg">Are you sure?</p>
+        <ul class="modal-warnings-list" id="modal-warnings" style="display:none;"></ul>
         <label class="modal-checkbox-row" id="modal-checkbox-wrap" for="modal-checkbox" style="display:none;">
           <input type="checkbox" id="modal-checkbox">
           <span id="modal-checkbox-label"></span>
@@ -1213,6 +1243,38 @@
     <div class="modal-actions">
       <button type="button" class="btn-modal-cancel" id="modal-btn-cancel">Cancel</button>
       <button type="button" class="btn-modal-confirm" id="modal-btn-confirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Restore Backup Choice Modal -->
+<div class="modal-backdrop" id="restore-modal" style="display:none;">
+  <div class="modal-dialog" style="max-width: 470px;">
+    <div class="modal-header-row">
+      <div class="modal-icon warning">↩️</div>
+      <div class="modal-body">
+        <h3 class="modal-title">Restore Channel Backup</h3>
+        <p class="modal-text">Choose which snapshot saved on the TV to restore. This stops <code>tvs_deamon.service</code> briefly, restores the selected DBs, and restarts the TV tuner.</p>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px;">
+      <div class="restore-slot-card" id="restore-slot-pre-edit" style="display:none;">
+        <div class="restore-slot-title">Last Pre-Edit Snapshot (before Delete / Move)</div>
+        <div class="restore-slot-meta" id="restore-pre-edit-meta"></div>
+        <div style="display:flex;justify-content:flex-end;">
+          <button type="button" class="btn-modal-confirm warning" id="btn-restore-pre-edit" style="padding:7px 14px;font-size:12.5px;">Restore Pre-Edit</button>
+        </div>
+      </div>
+      <div class="restore-slot-card" id="restore-slot-pre-import" style="display:none;">
+        <div class="restore-slot-title">Last Pre-Import Snapshot (before ZIP Import)</div>
+        <div class="restore-slot-meta" id="restore-pre-import-meta"></div>
+        <div style="display:flex;justify-content:flex-end;">
+          <button type="button" class="btn-modal-confirm" id="btn-restore-pre-import" style="padding:7px 14px;font-size:12.5px;">Restore Pre-Import</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn-modal-cancel" id="restore-btn-cancel">Close</button>
     </div>
   </div>
 </div>
@@ -1333,6 +1395,7 @@
   var confirmModal = document.getElementById('confirm-modal');
   var modalTitle = document.getElementById('modal-title');
   var modalMsg = document.getElementById('modal-msg');
+  var modalWarnings = document.getElementById('modal-warnings');
   var modalCheckboxWrap = document.getElementById('modal-checkbox-wrap');
   var modalCheckbox = document.getElementById('modal-checkbox');
   var modalCheckboxLabel = document.getElementById('modal-checkbox-label');
@@ -1340,6 +1403,18 @@
   var modalBtnCancel = document.getElementById('modal-btn-cancel');
   var modalBtnConfirm = document.getElementById('modal-btn-confirm');
   var pendingConfirmCallback = null;
+  var pendingCancelCallback = null;
+
+  var restoreModal = document.getElementById('restore-modal');
+  var restoreSlotPreEdit = document.getElementById('restore-slot-pre-edit');
+  var restorePreEditMeta = document.getElementById('restore-pre-edit-meta');
+  var btnRestorePreEdit = document.getElementById('btn-restore-pre-edit');
+  var restoreSlotPreImport = document.getElementById('restore-slot-pre-import');
+  var restorePreImportMeta = document.getElementById('restore-pre-import-meta');
+  var btnRestorePreImport = document.getElementById('btn-restore-pre-import');
+  var restoreBtnCancel = document.getElementById('restore-btn-cancel');
+  var btnRestorePrev = document.getElementById('btn-restore-prev');
+  var lastBackupStatus = null;
 
   var btnReloadTv = document.getElementById('btn-reload-tv');
   var btnStickyReload = document.getElementById('btn-sticky-reload');
@@ -1359,7 +1434,7 @@
     }
   }
 
-  function showConfirmModal(opts, onConfirm) {
+  function showConfirmModal(opts, onConfirm, onCancel) {
     modalTitle.textContent = opts.title || 'Confirm Action';
     modalMsg.textContent = opts.message || 'Are you sure?';
     modalBtnConfirm.textContent = opts.confirmText || 'Confirm';
@@ -1367,6 +1442,21 @@
     modalIcon.textContent = opts.icon || (isDanger ? '🗑️' : '⚠️');
     modalIcon.className = 'modal-icon' + (isDanger ? '' : ' warning');
     modalBtnConfirm.className = 'btn-modal-confirm' + (isDanger ? '' : ' warning');
+
+    if (modalWarnings) {
+      modalWarnings.innerHTML = '';
+      var warnings = opts.warnings && opts.warnings.length ? opts.warnings : [];
+      if (warnings.length > 0) {
+        for (var wi = 0; wi < warnings.length; wi++) {
+          var li = document.createElement('li');
+          li.textContent = String(warnings[wi]);
+          modalWarnings.appendChild(li);
+        }
+        modalWarnings.style.display = 'block';
+      } else {
+        modalWarnings.style.display = 'none';
+      }
+    }
 
     if (modalCheckboxWrap && modalCheckbox && modalCheckboxLabel) {
       if (opts.checkboxLabel) {
@@ -1380,24 +1470,34 @@
     }
 
     pendingConfirmCallback = onConfirm;
+    pendingCancelCallback = typeof onCancel === 'function' ? onCancel : null;
     confirmModal.style.display = 'flex';
   }
 
-  function hideConfirmModal() {
+  function hideConfirmModal(runCancel) {
     confirmModal.style.display = 'none';
+    var cancelCb = pendingCancelCallback;
     pendingConfirmCallback = null;
+    pendingCancelCallback = null;
+    if (modalWarnings) {
+      modalWarnings.innerHTML = '';
+      modalWarnings.style.display = 'none';
+    }
     if (modalCheckboxWrap && modalCheckbox) {
       modalCheckbox.checked = false;
       modalCheckboxWrap.style.display = 'none';
     }
+    if (runCancel === true && typeof cancelCb === 'function') {
+      cancelCb();
+    }
   }
 
-  if (modalBtnCancel) modalBtnCancel.addEventListener('click', hideConfirmModal);
+  if (modalBtnCancel) modalBtnCancel.addEventListener('click', function () { hideConfirmModal(true); });
   if (modalBtnConfirm) {
     modalBtnConfirm.addEventListener('click', function () {
       var cb = pendingConfirmCallback;
       var cbState = { checked: !!(modalCheckbox && modalCheckbox.checked) };
-      hideConfirmModal();
+      hideConfirmModal(false);
       if (cb) cb(cbState);
     });
   }
@@ -1417,7 +1517,130 @@
     });
   }
 
-  setupBackdropDismiss(confirmModal, hideConfirmModal);
+  setupBackdropDismiss(confirmModal, function () { hideConfirmModal(true); });
+
+  function formatBackupSlotMeta(slotInfo) {
+    if (!slotInfo || !slotInfo.available) return 'Not available';
+    var parts = [];
+    if (slotInfo.createdAt) {
+      var d = new Date(slotInfo.createdAt);
+      parts.push(isNaN(d.getTime()) ? slotInfo.createdAt : d.toLocaleString());
+    }
+    if (slotInfo.files && slotInfo.files.length > 0) {
+      parts.push('DBs: ' + slotInfo.files.join(', '));
+    }
+    if (slotInfo.reason) {
+      parts.push('Before: ' + slotInfo.reason);
+    } else if (slotInfo.sourceName) {
+      parts.push('Replaced by: ' + slotInfo.sourceName);
+    }
+    return parts.join(' | ');
+  }
+
+  function applyBackupStatusUi(data) {
+    lastBackupStatus = data || null;
+    if (btnRestorePrev) {
+      btnRestorePrev.style.display = (data && data.available) ? 'inline-flex' : 'none';
+    }
+  }
+
+  function fetchBackupStatus() {
+    return fetch('backup-status')
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data && data.ok) {
+          applyBackupStatusUi(data);
+        } else {
+          applyBackupStatusUi(null);
+        }
+        return data;
+      })
+      .catch(function () {
+        applyBackupStatusUi(null);
+        return null;
+      });
+  }
+
+  function hideRestoreModal() {
+    if (restoreModal) restoreModal.style.display = 'none';
+  }
+
+  function doRestoreSlot(slot, slotInfo) {
+    hideRestoreModal();
+    var slotLabel = slot === 'pre-edit' ? 'Pre-Edit Snapshot' : 'Pre-Import Snapshot';
+    var details = formatBackupSlotMeta(slotInfo);
+    showConfirmModal({
+      title: 'Restore ' + slotLabel + '?',
+      message: 'Stop tvs_deamon, restore ' + (details || slotLabel) + ', and restart the channel manager?',
+      confirmText: 'Restore Backup',
+      danger: false,
+      icon: '↩️'
+    }, function () {
+      showToast('⏳ Restoring ' + slotLabel + '…', 6000);
+      fetch('restore-backup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ slot: slot })
+      })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data.ok) {
+          showToast('✅ ' + (data.message || 'Backup restored!'), 3500);
+          setPendingReload(false);
+          fetchChannels(true);
+          fetchBackupStatus();
+        } else {
+          showToast('⚠️ Restore failed: ' + (data.error || 'error'), 4500);
+        }
+      })
+      .catch(function (err) {
+        showToast('⚠️ Restore error: ' + err.message, 4000);
+      });
+    });
+  }
+
+  if (btnRestorePrev) {
+    btnRestorePrev.addEventListener('click', function () {
+      fetchBackupStatus().then(function (status) {
+        if (!status || !status.available) {
+          showToast('No saved backup found on the TV.', 3000);
+          return;
+        }
+        var hasEdit = !!(status.preEdit && status.preEdit.available);
+        var hasImport = !!(status.preImport && status.preImport.available);
+        if (hasEdit && hasImport && restoreModal) {
+          if (restoreSlotPreEdit && restorePreEditMeta) {
+            restorePreEditMeta.textContent = formatBackupSlotMeta(status.preEdit);
+            restoreSlotPreEdit.style.display = 'block';
+          }
+          if (restoreSlotPreImport && restorePreImportMeta) {
+            restorePreImportMeta.textContent = formatBackupSlotMeta(status.preImport);
+            restoreSlotPreImport.style.display = 'block';
+          }
+          restoreModal.style.display = 'flex';
+        } else if (hasEdit) {
+          doRestoreSlot('pre-edit', status.preEdit);
+        } else if (hasImport) {
+          doRestoreSlot('pre-import', status.preImport);
+        }
+      });
+    });
+  }
+
+  if (btnRestorePreEdit) {
+    btnRestorePreEdit.addEventListener('click', function () {
+      doRestoreSlot('pre-edit', lastBackupStatus && lastBackupStatus.preEdit);
+    });
+  }
+  if (btnRestorePreImport) {
+    btnRestorePreImport.addEventListener('click', function () {
+      doRestoreSlot('pre-import', lastBackupStatus && lastBackupStatus.preImport);
+    });
+  }
+  if (restoreBtnCancel) {
+    restoreBtnCancel.addEventListener('click', hideRestoreModal);
+  }
+  setupBackdropDismiss(restoreModal, hideRestoreModal);
 
   function showToast(text, duration) {
     if (toastTimer) clearTimeout(toastTimer);
@@ -1691,6 +1914,7 @@
         setPendingReload(data.pendingReload !== false);
         clearAllSelections();
         fetchChannels(true);
+        if (action === 'delete') fetchBackupStatus();
       } else {
         showToast('⚠️ Update failed: ' + (data.error || 'error'), 3000);
       }
@@ -2216,6 +2440,7 @@
         }
 
         applyFilters();
+        fetchBackupStatus();
 
         setTimeout(function () {
           var firstTargetCard = firstMovedKey ? listEl.querySelector('.channel-card[data-key="' + firstMovedKey + '"]') : null;
@@ -2388,11 +2613,63 @@
     });
   }
 
-  // Import Channels Backup ZIP
+  // Import Channels Backup ZIP (two-phase validation + optional mismatch confirmation)
   var btnImportBak = document.getElementById('btn-import-bak');
   var fileImportInput = document.getElementById('file-import-input');
+  var isImporting = false;
+
+  function cancelStagedImport(confirmToken) {
+    fetch('import-cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ confirmToken: confirmToken })
+    }).catch(function () {});
+  }
+
+  function confirmStagedImport(confirmToken, warnings) {
+    showConfirmModal({
+      title: 'Archive Mismatch Detected',
+      message: 'This channel archive has region or model differences compared to your TV. Do you want to apply the validated databases anyway?',
+      warnings: warnings,
+      confirmText: 'Proceed with Import',
+      danger: false,
+      icon: '⚠️'
+    }, function () {
+      showToast('⏳ Stopping TV daemon and applying channel list…', 6000);
+      fetch('import-confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ confirmToken: confirmToken })
+      })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        isImporting = false;
+        if (data.ok) {
+          showToast('✅ ' + (data.message || 'Channels imported successfully!'), 3500);
+          setPendingReload(false);
+          fetchChannels(true);
+          fetchBackupStatus();
+        } else {
+          showToast('⚠️ Import failed: ' + (data.error || 'error'), 4500);
+        }
+      })
+      .catch(function (err) {
+        isImporting = false;
+        showToast('⚠️ Error completing import: ' + err.message, 4000);
+      });
+    }, function () {
+      isImporting = false;
+      cancelStagedImport(confirmToken);
+      showToast('Import cancelled — TV channel databases untouched.', 2500);
+    });
+  }
+
   if (btnImportBak && fileImportInput) {
     btnImportBak.addEventListener('click', function () {
+      if (isImporting) {
+        showToast('⏳ An import is already in progress…', 2500);
+        return;
+      }
       fileImportInput.value = '';
       fileImportInput.click();
     });
@@ -2404,28 +2681,38 @@
       var sizeKb = Math.round(file.size / 1024);
       showConfirmModal({
         title: 'Import Channel Backup?',
-        message: 'Import "' + file.name + '" (' + sizeKb + ' KB)? This will replace the TV channel databases and reload the TV tuner.',
-        confirmText: 'Import & Apply',
+        message: 'Validate and import "' + file.name + '" (' + sizeKb + ' KB)? Existing TV databases will be backed up before replacing.',
+        confirmText: 'Validate & Import',
         danger: false,
         icon: '📥'
       }, function () {
-        showToast('⏳ Uploading and importing channel list…', 5000);
+        isImporting = true;
+        showToast('⏳ Uploading and validating archive…', 6000);
 
         fetch('import', {
           method: 'POST',
+          headers: { 'X-Upload-Filename': encodeURIComponent(file.name) },
           body: file
         })
         .then(function (res) { return res.json(); })
         .then(function (data) {
+          if (data.ok && data.needsConfirm && data.confirmToken) {
+            confirmStagedImport(data.confirmToken, data.warnings || []);
+            return;
+          }
+          isImporting = false;
           if (data.ok) {
-            showToast('✅ ' + (data.message || 'Channels imported successfully!'), 3000);
+            showToast('✅ ' + (data.message || 'Channels imported successfully!'), 3500);
+            setPendingReload(false);
             fetchChannels(true);
+            fetchBackupStatus();
           } else {
-            showToast('⚠️ Import failed: ' + (data.error || 'error'), 4000);
+            showToast('⚠️ Import failed: ' + (data.error || 'error'), 4500);
           }
         })
         .catch(function (err) {
-          showToast('⚠️ Error uploading backup: ' + err.message, 3500);
+          isImporting = false;
+          showToast('⚠️ Error uploading backup: ' + err.message, 4000);
         });
       });
     });
@@ -2630,6 +2917,7 @@
 
   // Initial Load
   fetchChannels(false);
+  fetchBackupStatus();
 
 })();
 </script>
