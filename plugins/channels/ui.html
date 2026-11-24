@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>TV Channels</title>
 <style>
   :root {
@@ -2244,7 +2245,6 @@
   var moveInputTarget = document.getElementById('move-input-target');
   var movePreview = document.getElementById('move-preview');
   var moveError = document.getElementById('move-error');
-  var moveBtnClose = document.getElementById('move-btn-close');
   var moveBtnCancel = document.getElementById('move-btn-cancel');
   var moveBtnConfirm = document.getElementById('move-btn-confirm');
   var btnBatchMove = document.getElementById('btn-batch-move');
@@ -2460,7 +2460,6 @@
   }
 
   if (btnBatchMove) btnBatchMove.addEventListener('click', openMoveModal);
-  if (moveBtnClose) moveBtnClose.addEventListener('click', closeMoveModal);
   if (moveBtnCancel) moveBtnCancel.addEventListener('click', closeMoveModal);
   if (moveBtnConfirm) moveBtnConfirm.addEventListener('click', doSaveMove);
   if (moveInputTarget) {
@@ -2608,7 +2607,9 @@
 
   if (btnExportBak) {
     btnExportBak.addEventListener('click', function () {
-      var directExportUrl = window.location.href.split('?')[0].replace(/\/ui\/?$/, '/export');
+      var hrefParts = window.location.href.split('?');
+      var exportBase = hrefParts[0].replace(/\/ui\/?$/, '/export');
+      var directExportUrl = hrefParts.length > 1 ? (exportBase + '?' + hrefParts.slice(1).join('?')) : exportBase;
       showExportModal('Channel_list_backup.zip', directExportUrl);
     });
   }

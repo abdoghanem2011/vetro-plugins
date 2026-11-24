@@ -918,7 +918,7 @@ test('POST api/restore-backup validates backup against baseline schema (ignores 
 
     var restoreScripts = [];
     var exec = createRealSqliteExecutor(function (cmd) {
-        if (cmd.indexOf('RESTORE_COPY_FAILED') >= 0) {
+        if (cmd.indexOf('RESTORE_ROLLED_BACK') >= 0) {
             restoreScripts.push(cmd);
             return { exit_code: 0, stdout: 'SUCCESS\n', stderr: '' };
         }
@@ -939,10 +939,56 @@ test('POST api/restore-backup validates backup against baseline schema (ignores 
     assert.equal(restoreScripts.length, 1);
     assert.ok(restoreScripts[0].indexOf('change_source') < 0, 'restore-backup must NOT switch input to TV');
     assert.ok(restoreScripts[0].indexOf('trap cleanup_start EXIT') >= 0);
+    assert.ok(restoreScripts[0].indexOf('RB_DIR=') >= 0);
+    assert.ok(restoreScripts[0].indexOf('rm -rf "$RB_DIR"') >= 0);
+    assert.ok(restoreScripts[0].indexOf('RESTORE_ROLLED_BACK') >= 0);
 
     // Invalid slot rejected with 400
     var badSlot = await invokeRoute(p, { method: 'POST', sub: 'restore-backup', body: { slot: 'invalid-slot' } });
     assert.equal(badSlot.status, 400);
+});
+
+test('B1: outStream open error (before close) still returns 500 and releases dbBusy', async function (t) {
+    var env = createTempEnv(t);
+    var missingTmpDir = path.join(env.root, 'missing-dir', 'sub');
+    var exec = createRealSqliteExecutor();
+    var p = pluginFactory({ dir: env.pluginDir, _dataDir: env.dataDir, _tmpDir: missingTmpDir, execute: exec.execute });
+    p.start();
+    t.after(function () { p.stop(); });
+
+    var errRes = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import',
+        headers: { 'x-upload-filename': 'broken_tmp.zip' },
+        body: Buffer.from('PK_FAKE_DATA')
+    });
+    assert.equal(errRes.status, 500);
+    assert.equal(errRes.json.ok, false);
+
+    // Verify dbBusy was released (over-limit Content-Length returns 413 instead of 409)
+    var followRes = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import',
+        headers: { 'content-length': String(16 * 1024 * 1024) },
+        manualStream: true
+    });
+    assert.equal(followRes.status, 413, 'dbBusy must not be stuck at 409 after WriteStream open error');
+});
+
+test('POST api/tune rejects channel numbers outside 1-9999 in digit-fallback path', async function (t) {
+    var env = createTempEnv(t);
+    var exec = createRealSqliteExecutor();
+    var p = pluginFactory({ dir: env.pluginDir, _dataDir: env.dataDir, _tmpDir: env.tmpDir, execute: exec.execute });
+    p.start();
+    t.after(function () { p.stop(); });
+
+    for (var badNum of [0, -5, 10000, 1e21]) {
+        var r = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: badNum } });
+        assert.equal(r.status, 400, 'Expected 400 for channel=' + badNum);
+    }
+    var okNum = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 42 } });
+    assert.equal(okNum.status, 200);
+    assert.equal(okNum.json.method, 'keys');
 });
 
 // ==================== 4. SECURITY, EXPORT, RELOAD, UI & LIFECYCLE ====================
@@ -1010,9 +1056,11 @@ test('CORS disabled, remote key allow-list hardened, export locked, reload avoid
     assert.ok(expCmd.indexOf('5198920') < 0);
     assert.ok(expCmd.indexOf('DIGITAL_COUNTRY') < 0);
 
-    // B2 UI check: selections keyed by type:srvId via data-key
+    // B2 UI check & guideline hygiene: selections keyed by type:srvId, color-scheme meta, query preserved on export URL
     assert.ok(uiRes.body.indexOf('function getChannelKey(ch)') >= 0);
     assert.ok(uiRes.body.indexOf('data-key="') >= 0);
+    assert.ok(uiRes.body.indexOf('<meta name="color-scheme" content="dark">') >= 0);
+    assert.ok(uiRes.body.indexOf('hrefParts.slice(1)') >= 0);
 
     // stop() clears state cleanly
     p.stop();

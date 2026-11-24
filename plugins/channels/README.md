@@ -33,7 +33,7 @@ Adds a unified **Channels** tab to the Vetro dashboard:
 | Command | Why |
 | --- | --- |
 | `/usr/bin/launch_app org.tizen.tv-viewer tune_channel <srvId>` | Instant direct channel switching via native TV service ID without digit delay |
-| `/usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user` | Switches input to Live Broadcast TV only when clicking **📺 TV Mode** (or when `forceTv` is set) |
+| `/usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user` | Switches input to Live Broadcast TV only when clicking **📺 TV Mode** |
 | `dbus-send --system --type=method_call --dest=org.enlightenment.wm /org/enlightenment/wm org.enlightenment.wm.Test.EventKey uint32:<0\|1> string:<key>` | Fallback key injection for numeric channel tuning or exiting TV menus |
 | `/usr/bin/input_keyevent <keysym>` | Sends remote key events strictly from the allow-list: `XF86AudioRaiseVolume`, `XF86AudioLowerVolume`, `XF86AudioMute`, `XF86RaiseChannel`, `XF86LowerChannel`, `XF86Exit` |
 | `sqlite3 -bail ...` | Reads channel tables (optional missing DBs skipped), creates online `.backup` pre-edit snapshots, runs single/`ATTACH` `-bail` SQL scripts (`ch_del_*`, `ch_mv_*`, `ch_vis_*`, `ch_ren_*`), and checkpoints WAL logs |
@@ -41,9 +41,9 @@ Adds a unified **Channels** tab to the Vetro dashboard:
 | `sh -c "..."` | Runs serialized export, reload, import validation/swap, restore, and pre-edit backup scripts |
 | `/usr/bin/flock -n 9` | Serializes stopped-daemon swap, restore, and reload operations on `/tmp/vetro_channels_db.lock` |
 | `systemctl cat` / `stop` / `start` / `restart` `tvs_deamon.service` (fallback `tvs_daemon.service`, or `pkill -9 tvs-daemon` on reload only if unit absent) | Resolves the service unit, cleanly stops it during DB replacement, guarantees restart via shell `EXIT` trap, and restarts it on **Reload TV** |
-| `cp` / `cp -p` / `mv` / `chmod` / `chown` / `wc` / `sed` / `printf` | Manages atomic backup rotation into `<shard-dir>/backup/`, sets root permissions on TV DBs, and verifies extracted file sizes and symlinks |
+| `cp` / `cp -p` / `mv` / `chmod` / `chown` / `wc` | Manages atomic backup rotation into `<shard-dir>/backup/`, sets root permissions on TV DBs, and verifies extracted file sizes and symlinks |
 | `rm -f .../*-wal .../*-shm` / `rm -f` / `rm -rf` / `mkdir -p` | Removes stale WAL/SHM files while the daemon is stopped and cleans staging/temp files |
-| `cat` / `grep -i "^Version="` / `cut` / `tr` | Reads TV `metadata.xml` and `/etc/prd_info.ini` version/model metadata |
+| `cat` / `grep -i "^Version="` / `head` / `cut` / `tr` | Reads TV `metadata.xml` and `/etc/prd_info.ini` version/model metadata |
 | `/usr/bin/zip -j /tmp/ch_exp_*.zip ...` | Packages existing TV channel databases (and existing `metadata.xml` if present) under lock |
 | `/usr/bin/unzip -t` / `/usr/bin/unzip -l` / `/usr/bin/unzip -o -q` | Validates zip integrity, enforces size/entry/path limits, and extracts only allowlisted non-symlink files |
 | `sleep 1` / `sleep 0.5` / `sleep 0.05` | Pauses briefly after daemon restart or D-Bus key events |
@@ -58,7 +58,7 @@ None. All queries and commands execute locally on the TV.
   - `pre-import/`: databases (`dvbs`, `sat`, `ipsrv`, `dvbt`, `dvbc`) and `backup-meta.json` captured while `tvs_deamon.service` is stopped right before applying an imported ZIP archive.
   - `pre-edit/`: online SQLite `.backup` snapshot and `backup-meta.json` captured before every `delete` or `move` edit, leaving `pre-import/` intact.
   - Note: Shard updates replace files in the plugin directory other than `config.json`, and uninstalling the Shard removes it (use **Export Backup** for permanent off-TV copies).
-- **Temporary files in `/tmp/`:** `/tmp/ch_exp_*.zip`, `/tmp/ch_up_*.zip`, `/tmp/ch_imp_*`, `/tmp/ch_bmeta_*.json`, `/tmp/ch_ebak_*.json`, `/tmp/ch_del_*.sql`, `/tmp/ch_mv_*.sql`, `/tmp/ch_vis_*.sql`, `/tmp/ch_ren_*.sql`, and `/tmp/vetro_channels_db.lock`. Cleaned up on normal completion, stream abort/error, `stop()`, and via shell `EXIT` traps; an unexpected `SIGKILL` or power loss mid-operation may leave a temp file in `/tmp` until the TV reboots.
+- **Temporary files in `/tmp/`:** `/tmp/ch_exp_*.zip`, `/tmp/ch_up_*.zip`, `/tmp/ch_imp_*`, `/tmp/ch_rb_*`, `/tmp/ch_bmeta_*.json`, `/tmp/ch_ebak_*.json`, `/tmp/ch_del_*.sql`, `/tmp/ch_mv_*.sql`, `/tmp/ch_vis_*.sql`, `/tmp/ch_ren_*.sql`, and `/tmp/vetro_channels_db.lock`. Cleaned up on normal completion, stream abort/error, `stop()`, and via shell `EXIT` traps; an unexpected `SIGKILL` or power loss mid-operation may leave a temp file in `/tmp` until the TV reboots.
 
 > [!WARNING]
 > Importing or restoring a channel backup replaces the TV's native channel databases in `/mnt/systemrw/tvs-chms/data/` while `tvs_deamon.service` is stopped. Always verify backups before confirming region or model mismatch warnings.

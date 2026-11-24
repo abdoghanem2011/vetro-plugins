@@ -16,7 +16,6 @@ var DEFAULT_DATA_DIR = '/mnt/systemrw/tvs-chms/data';
 var DEFAULT_TMP_DIR = '/tmp';
 var ALLOWED_DBS = ['dvbs', 'sat', 'ipsrv', 'dvbt', 'dvbc'];
 var SRVID_RE = /^-?[0-9]+$/;
-var SAFE_IDENT_RE = /^[A-Za-z0-9_]+$/;
 var MAX_CHANNEL_NAME_LEN = 60;
 var CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 var MAX_IMPORT_BYTES = 15 * 1024 * 1024;
@@ -890,8 +889,15 @@ function channelsPlugin(ctx) {
 
         var ownerUg = getDirOwnerUg();
         var fileArgs = '';
+        var bakSteps = '';
         for (var j = 0; j < dbList.length; j++) {
-            fileArgs += (j > 0 ? ' ' : '') + shQuote(dbList[j]);
+            var bf = dbList[j];
+            var qf = shQuote(bf);
+            fileArgs += (j > 0 ? ' ' : '') + qf;
+            var bkSql = ".backup '" + sqlPath(path.join(preEditDir + '.new', bf)) + "'";
+            bakSteps += 'if [ -f "$DATA_DIR/"' + qf + ' ]; then ' +
+                'sqlite3 -bail "$DATA_DIR/"' + qf + ' ' + shQuote(bkSql) + ' >/dev/null 2>&1 || { rm -rf "$NEW_DIR" "$META_TMP"; echo ' + shQuote('BACKUP_SQLITE_FAILED_' + bf) + '; exit 13; }; ' +
+                'fi; ';
         }
 
         var script =
@@ -909,12 +915,7 @@ function channelsPlugin(ctx) {
             'mkdir -p "$BACKUP_BASE" || { rm -f "$META_TMP"; echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
             'rm -rf "$NEW_DIR" "$OLD_DIR"; ' +
             'mkdir -p "$NEW_DIR" || { rm -f "$META_TMP"; echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
-            'for f in ' + fileArgs + '; do ' +
-            '  if [ -f "$DATA_DIR/$f" ]; then ' +
-            '    BK_SQL=".backup \'"$(printf \'%s\' "$NEW_DIR/$f" | sed "s/\'/\'\'/g")"\'"; ' +
-            '    sqlite3 -bail "$DATA_DIR/$f" "$BK_SQL" >/dev/null 2>&1 || { rm -rf "$NEW_DIR" "$META_TMP"; echo "BACKUP_SQLITE_FAILED_$f"; exit 13; }; ' +
-            '  fi; ' +
-            'done; ' +
+            bakSteps +
             'cp "$META_TMP" "$NEW_DIR/backup-meta.json" || { rm -rf "$NEW_DIR" "$META_TMP"; echo "BACKUP_META_FAILED"; exit 13; }; ' +
             'rm -f "$META_TMP"; ' +
             (ownerUg ? ('chown -R ' + shQuote(ownerUg) + ' "$NEW_DIR" 2>/dev/null || true; ') : '') +
@@ -1093,7 +1094,7 @@ function channelsPlugin(ctx) {
 
                 return validateNextDb();
             });
-        }, function (err) {
+        }).then(null, function (err) {
             try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
             rmrfSync(tmpDir);
             return { errorCode: 500, error: err.message };
@@ -1110,13 +1111,23 @@ function channelsPlugin(ctx) {
 
         var id = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
         var metaTmp = path.join(tmpRoot, 'ch_bmeta_' + id + '.json');
+        var liveFiles = [];
+        for (var li = 0; li < ALLOWED_DBS.length; li++) {
+            var ldb = ALLOWED_DBS[li];
+            try {
+                if (fs.existsSync(path.join(dataDir, ldb))) {
+                    liveFiles.push(ldb);
+                }
+            } catch (e) { /* ignore stat error */ }
+        }
         try {
             fs.writeFileSync(metaTmp, JSON.stringify({
                 createdAt: new Date().toISOString(),
                 slot: 'pre-import',
                 reason: 'import',
                 sourceName: sanitizeFileName(sourceName),
-                files: dbFiles.slice(),
+                files: liveFiles,
+                importedFiles: dbFiles.slice(),
                 model: tvModel || ''
             }, null, 2), 'utf8');
         } catch (metaErr) {
@@ -1429,7 +1440,8 @@ function channelsPlugin(ctx) {
                         return;
                     }
 
-                    var channel = parseInt(parsed.channel, 10);
+                    var chRaw = parsed.channel != null ? String(parsed.channel).trim() : '';
+                    var channel = /^[0-9]+$/.test(chRaw) ? parseInt(chRaw, 10) : NaN;
                     var srvId = parsed.srvId != null ? String(parsed.srvId).trim() : null;
                     var forceTv = !!parsed.forceTv;
 
@@ -1455,8 +1467,8 @@ function channelsPlugin(ctx) {
                     }
 
                     // METHOD 2 (Fallback): High-Speed Async D-Bus Key Injection
-                    if (!channel || isNaN(channel) || channel <= 0) {
-                        sendJson(res, 400, { ok: false, error: 'invalid channel number or srvId' });
+                    if (!channel || isNaN(channel) || channel <= 0 || channel > 9999) {
+                        sendJson(res, 400, { ok: false, error: 'invalid channel number (must be 1-9999) or srvId' });
                         return;
                     }
 
@@ -1983,12 +1995,13 @@ function channelsPlugin(ctx) {
                     var outClosed = false;
                     var uploadEnded = false;
                     var settled = false;
+                    var activeFinalize = null;
 
                     outStream.once('close', function () {
                         outClosed = true;
                     });
 
-                    function abortUpload(statusCode, errMsg, destroyReqAfterRes) {
+                    function abortUpload(statusCode, errMsg, destroyReqAfterRes, immediate) {
                         if (settled) return;
                         settled = true;
 
@@ -1996,7 +2009,11 @@ function channelsPlugin(ctx) {
                             try { req.unpipe(outStream); } catch (e) {}
                         }
 
+                        var finalized = false;
                         function finalizeCleanup() {
+                            if (finalized) return;
+                            finalized = true;
+                            activeFinalize = null;
                             try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
                             release();
                             if (destroyReqAfterRes && typeof req.destroy === 'function') {
@@ -2012,8 +2029,19 @@ function channelsPlugin(ctx) {
                                 sendJson(res, statusCode, { ok: false, error: errMsg });
                             }
                         }
+                        activeFinalize = finalizeCleanup;
 
-                        if (outClosed) {
+                        if (outClosed || immediate) {
+                            if (!outClosed) {
+                                outStream.once('close', function () {
+                                    try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                                });
+                                if (typeof outStream.destroy === 'function') {
+                                    try { outStream.destroy(); } catch (e) {}
+                                } else if (typeof outStream.end === 'function') {
+                                    try { outStream.end(); } catch (e) {}
+                                }
+                            }
                             finalizeCleanup();
                         } else {
                             outStream.once('close', finalizeCleanup);
@@ -2031,7 +2059,7 @@ function channelsPlugin(ctx) {
                         if (settled) return;
                         receivedBytes += chunk.length;
                         if (receivedBytes > MAX_IMPORT_BYTES) {
-                            abortUpload(413, 'Archive exceeds 15 MB limit.', true);
+                            abortUpload(413, 'Archive exceeds 15 MB limit.', true, false);
                         }
                     });
 
@@ -2040,21 +2068,25 @@ function channelsPlugin(ctx) {
                     });
 
                     req.on('aborted', function () {
-                        abortUpload(400, 'Upload aborted by client.', false);
+                        abortUpload(400, 'Upload aborted by client.', false, false);
                     });
 
                     req.on('close', function () {
                         if (!uploadEnded && !settled) {
-                            abortUpload(400, 'Upload connection closed before completion.', false);
+                            abortUpload(400, 'Upload connection closed before completion.', false, false);
                         }
                     });
 
                     req.on('error', function (err) {
-                        abortUpload(400, 'Upload failed: ' + err.message, false);
+                        abortUpload(400, 'Upload failed: ' + err.message, false, false);
                     });
 
                     outStream.on('error', function (err) {
-                        abortUpload(500, 'Failed writing upload stream: ' + err.message, true);
+                        if (settled) {
+                            if (typeof activeFinalize === 'function') activeFinalize();
+                            return;
+                        }
+                        abortUpload(500, 'Failed writing upload stream: ' + err.message, true, true);
                     });
 
                     outStream.on('finish', function () {
@@ -2189,23 +2221,46 @@ function channelsPlugin(ctx) {
                                 for (var fi = 0; fi < files.length; fi++) {
                                     fileArgs += (fi > 0 ? ' ' : '') + shQuote(files[fi]);
                                 }
+                                var rbId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+                                var rbDir = path.join(tmpRoot, 'ch_rb_' + rbId);
                                 var restoreScript =
                                     'exec 9>' + shQuote(lockFile) + '; ' +
                                     '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
                                     TVS_UNIT_RESOLVE +
                                     'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
                                     'systemctl stop "$UNIT" >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
+                                    'DATA_DIR=' + shQuote(dataDir) + '; ' +
+                                    'BACKUP_DIR=' + shQuote(slotDir) + '; ' +
+                                    'RB_DIR=' + shQuote(rbDir) + '; ' +
                                     'RESTARTED=0; ' +
                                     'cleanup_start() { ' +
+                                    '  rm -rf "$RB_DIR" 2>/dev/null || true; ' +
                                     '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
                                     '}; ' +
                                     'trap cleanup_start EXIT; ' +
-                                    'DATA_DIR=' + shQuote(dataDir) + '; ' +
-                                    'BACKUP_DIR=' + shQuote(slotDir) + '; ' +
+                                    'rm -rf "$RB_DIR" && mkdir -p "$RB_DIR" || { echo "RESTORE_RB_MKDIR_FAILED"; exit 13; }; ' +
+                                    'for f in dvbs sat ipsrv dvbt dvbc; do ' +
+                                    '  if [ -f "$DATA_DIR/$f" ]; then ' +
+                                    '    cp -p "$DATA_DIR/$f" "$RB_DIR/$f" || { echo "RESTORE_RB_COPY_FAILED"; exit 13; }; ' +
+                                    '  fi; ' +
+                                    'done; ' +
                                     'rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
+                                    'COPY_ERR=0; ' +
                                     'for f in ' + fileArgs + '; do ' +
-                                    '  cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || { echo "RESTORE_COPY_FAILED"; exit 14; }; ' +
-                                    '  sqlite3 -bail "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; ' +
+                                    '  cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || { COPY_ERR=1; break; }; ' +
+                                    'done; ' +
+                                    'if [ "$COPY_ERR" -ne 0 ]; then ' +
+                                    '  rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
+                                    '  for f in dvbs sat ipsrv dvbt dvbc; do ' +
+                                    '    if [ -f "$RB_DIR/$f" ]; then cp "$RB_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || true; fi; ' +
+                                    '  done; ' +
+                                    '  for f in ' + fileArgs + '; do ' +
+                                    '    if [ ! -f "$RB_DIR/$f" ]; then rm -f "$DATA_DIR/$f"; fi; ' +
+                                    '  done; ' +
+                                    '  echo "RESTORE_ROLLED_BACK"; exit 14; ' +
+                                    'fi; ' +
+                                    'for f in ' + fileArgs + '; do ' +
+                                    '  [ -f "$DATA_DIR/$f" ] && sqlite3 -bail "$DATA_DIR/$f" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; ' +
                                     'done; ' +
                                     'systemctl start "$UNIT" >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
                                     'RESTARTED=1; ' +
@@ -2228,6 +2283,10 @@ function channelsPlugin(ctx) {
                                     }
                                     if (out.indexOf('LOCKED') >= 0) {
                                         sendJson(res, 409, { ok: false, error: 'Database lock held by another operation. Please retry in a few seconds.' });
+                                        return;
+                                    }
+                                    if (out.indexOf('RESTORE_ROLLED_BACK') >= 0) {
+                                        sendJson(res, 500, { ok: false, error: 'Failed while copying backup files; previous TV databases were rolled back.' });
                                         return;
                                     }
                                     sendJson(res, 500, { ok: false, error: 'Restore failed (' + (out || r.stderr || 'exit code ' + r.exit_code) + ').' });
