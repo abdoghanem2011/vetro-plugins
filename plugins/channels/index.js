@@ -29,6 +29,30 @@ var TVS_UNIT_RESOLVE =
     'if systemctl cat tvs_deamon.service >/dev/null 2>&1; then UNIT="tvs_deamon.service"; ' +
     'elif systemctl cat tvs_daemon.service >/dev/null 2>&1; then UNIT="tvs_daemon.service"; fi; ';
 
+var VETRO_TUNER_UNIT = 'vetro-tuner.service';
+var VETRO_TUNER_PID = '/home/owner/vetro-tuner.pid';
+var VETRO_TUNER_PIPE = '/tmp/vetro-tuner.ctl';
+var VETRO_TUNER_SHOWN = '/tmp/vetro-tuner.ctl.shown';
+
+// Exact same non-blocking FIFO liveness check used by Vetro's key-routing.js (exec 3<> never blocks).
+var VETRO_TUNER_ALIVE_SH =
+    'p=$(cat ' + shQuote(VETRO_TUNER_PID) + ' 2>/dev/null); ' +
+    '[ -n "$p" ] && [ -d "/proc/$p" ] && [ -p ' + shQuote(VETRO_TUNER_PIPE) + ' ]';
+
+var VETRO_TUNER_SHOWN_SH =
+    VETRO_TUNER_ALIVE_SH + ' && [ -e ' + shQuote(VETRO_TUNER_SHOWN) + ' ]';
+
+// Restart Vetro TV Tuner after tvs-daemon restarts so it drops its cached channel list and reconnects.
+// Uses --no-block for Tizen 9 systemd/SMACK D-Bus compatibility; falls back to pipe 'quit' if started outside systemd.
+// Completely a no-op when Vetro TV Tuner is not installed or not running.
+var VETRO_TUNER_RESTART_SH =
+    '{ if [ "$(systemctl is-active ' + VETRO_TUNER_UNIT + ' 2>/dev/null)" = "active" ]; then ' +
+    'systemctl restart --no-block ' + VETRO_TUNER_UNIT + ' </dev/null >/dev/null 2>&1 || true; ' +
+    'else tp=$(cat ' + shQuote(VETRO_TUNER_PID) + ' 2>/dev/null); ' +
+    'if [ -n "$tp" ] && [ -d "/proc/$tp" ] && tr \'\\0\' \' \' < "/proc/$tp/cmdline" 2>/dev/null | grep -q \'vetro-tuner.dll\' && [ -p ' + shQuote(VETRO_TUNER_PIPE) + ' ]; then ' +
+    '( exec 3<>' + shQuote(VETRO_TUNER_PIPE) + ' && echo \'quit\' >&3 ) 2>/dev/null || true; ' +
+    'fi; fi; }';
+
 function createDict() {
     return Object.create(null);
 }
@@ -779,6 +803,23 @@ ALLOWED_KEYS.XF86LowerChannel = 'XF86LowerChannel';
 ALLOWED_KEYS.exit = 'XF86Exit';
 ALLOWED_KEYS.XF86Exit = 'XF86Exit';
 
+var TUNER_PIPE_KEYS = createDict();
+TUNER_PIPE_KEYS.XF86RaiseChannel = 'key 88';
+TUNER_PIPE_KEYS.XF86LowerChannel = 'key 87';
+TUNER_PIPE_KEYS.XF86Exit = 'key 174';
+
+function buildKeyCommand(keySym) {
+    if (hasOwn(TUNER_PIPE_KEYS, keySym)) {
+        var pipeWord = TUNER_PIPE_KEYS[keySym];
+        return wrapSh(
+            'if ' + VETRO_TUNER_SHOWN_SH + '; then ' +
+            '( exec 3<>' + shQuote(VETRO_TUNER_PIPE) + ' && echo ' + shQuote(pipeWord) + ' >&3 ); ' +
+            'else /usr/bin/input_keyevent ' + keySym + ' </dev/null; fi'
+        );
+    }
+    return '/usr/bin/input_keyevent ' + keySym;
+}
+
 function channelsPlugin(ctx) {
     var page = null;
     var cachedChannels = null;
@@ -1189,7 +1230,7 @@ function channelsPlugin(ctx) {
             'RESTARTED=0; ' +
             'cleanup_on_exit() { ' +
             '  rm -rf "$TMP_DIR" "$META_TMP" 2>/dev/null || true; ' +
-            '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
+            '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; sleep 1; ' + VETRO_TUNER_RESTART_SH + '; fi; ' +
             '}; ' +
             'trap cleanup_on_exit EXIT; ' +
             'for f in dvbs sat ipsrv dvbt dvbc; do ' +
@@ -1230,6 +1271,7 @@ function channelsPlugin(ctx) {
             'systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
             'RESTARTED=1; ' +
             'sleep 1; ' +
+            VETRO_TUNER_RESTART_SH + '; ' +
             'echo "SUCCESS"';
 
         return ctx.execute(wrapSh(script), 30000).then(function (r) {
@@ -1487,8 +1529,37 @@ function channelsPlugin(ctx) {
                         }
                     }
 
-                    // METHOD 1: Instant Direct Tune via srvId (0ms delay, no digit entry)
+                    // METHOD 1: Instant Direct Tune via srvId (or Vetro TV Tuner control pipe when visible & unambiguous)
                     if (srvId && SRVID_RE.test(srvId)) {
+                        var canUseTunerPipe = false;
+                        if (!pendingReload && !isNaN(channel) && channel >= 1 && channel <= 9999 && Array.isArray(cachedChannels)) {
+                            var matchedRow = null;
+                            var sameNumVisible = 0;
+                            for (var ci = 0; ci < cachedChannels.length; ci++) {
+                                var row = cachedChannels[ci];
+                                if (!row) continue;
+                                if (row.srvId === srvId) matchedRow = row;
+                                if (!row.hidden && row.num === channel) sameNumVisible++;
+                            }
+                            if (matchedRow && !matchedRow.hidden && matchedRow.num === channel && sameNumVisible === 1) {
+                                canUseTunerPipe = true;
+                            }
+                        }
+
+                        if (canUseTunerPipe) {
+                            var tuneScript =
+                                'if ' + VETRO_TUNER_SHOWN_SH + '; then ' +
+                                '( exec 3<>' + shQuote(VETRO_TUNER_PIPE) + ' && echo ' + shQuote('tune ' + channel) + ' >&3 ) && echo "__METHOD__=tuner"; ' +
+                                'else /usr/bin/launch_app org.tizen.tv-viewer tune_channel ' + srvId + ' </dev/null && echo "__METHOD__=direct"; fi';
+                            ctx.execute(wrapSh(tuneScript), 4000).then(function (r) {
+                                var methodUsed = (r.stdout || '').indexOf('__METHOD__=tuner') >= 0 ? 'tuner' : 'direct';
+                                sendJson(res, 200, { ok: r.exit_code === 0, channel: channel, srvId: srvId, method: methodUsed });
+                            }, function (e) {
+                                sendJson(res, 500, { ok: false, error: e.message });
+                            });
+                            return;
+                        }
+
                         var launchCmd = '/usr/bin/launch_app org.tizen.tv-viewer tune_channel ' + srvId;
                         ctx.execute(launchCmd, 4000).then(function (r) {
                             sendJson(res, 200, { ok: r.exit_code === 0, channel: channel, srvId: srvId, method: 'direct' });
@@ -1498,7 +1569,7 @@ function channelsPlugin(ctx) {
                         return;
                     }
 
-                    // METHOD 2 (Fallback): High-Speed Async D-Bus Key Injection
+                    // METHOD 2 (Fallback): High-Speed Async D-Bus Key Injection (or Vetro TV Tuner pipe when shown)
                     if (!channel || isNaN(channel) || channel <= 0 || channel > 9999) {
                         sendJson(res, 400, { ok: false, error: 'invalid channel number (must be 1-9999) or srvId' });
                         return;
@@ -1524,10 +1595,14 @@ function channelsPlugin(ctx) {
                     keyCmds.push('dbus-send --system --type=method_call --dest=org.enlightenment.wm /org/enlightenment/wm org.enlightenment.wm.Test.EventKey uint32:1 string:Return');
                     keyCmds.push('dbus-send --system --type=method_call --dest=org.enlightenment.wm /org/enlightenment/wm org.enlightenment.wm.Test.EventKey uint32:0 string:Return');
 
-                    var fullCmd = keyCmds.join('; ');
+                    var fallbackScript =
+                        'if ' + VETRO_TUNER_SHOWN_SH + '; then ' +
+                        '( exec 3<>' + shQuote(VETRO_TUNER_PIPE) + ' && echo ' + shQuote('tune ' + channel) + ' >&3 ) && echo "__METHOD__=tuner"; ' +
+                        'else ' + keyCmds.join('; ') + '; fi';
 
-                    ctx.execute(fullCmd, 6000).then(function (r) {
-                        sendJson(res, 200, { ok: r.exit_code === 0, channel: channel, method: 'keys', stderr: r.stderr });
+                    ctx.execute(wrapSh(fallbackScript), 6000).then(function (r) {
+                        var fallbackMethod = (r.stdout || '').indexOf('__METHOD__=tuner') >= 0 ? 'tuner' : 'keys';
+                        sendJson(res, 200, { ok: r.exit_code === 0, channel: channel, method: fallbackMethod, stderr: r.stderr });
                     }, function (e) {
                         sendJson(res, 500, { ok: false, error: e.message });
                     });
@@ -1537,7 +1612,11 @@ function channelsPlugin(ctx) {
 
             // POST api/tvsource — switch input directly to Broadcast TV
             if ((sub === 'tvsource' || action === 'tvsource') && req.method === 'POST') {
-                var switchCmd = wrapSh('/usr/bin/input_keyevent XF86Exit </dev/null; /usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user </dev/null');
+                var switchCmd = wrapSh(
+                    '/usr/bin/input_keyevent XF86Exit </dev/null; ' +
+                    '/usr/bin/launch_app org.tizen.tv-viewer change_source 0 sourceType 0 sourceName TV mbrIndex -2 __K_EX_LAUNCH_REQUESTOR user </dev/null; ' +
+                    'if ' + VETRO_TUNER_ALIVE_SH + '; then ( exec 3<>' + shQuote(VETRO_TUNER_PIPE) + ' && echo \'resume\' >&3 ) 2>/dev/null || true; fi'
+                );
                 ctx.execute(switchCmd, 6000).then(function (r) {
                     sendJson(res, 200, { ok: r.exit_code === 0 });
                 }, function (e) {
@@ -1546,15 +1625,16 @@ function channelsPlugin(ctx) {
                 return true;
             }
 
-            // POST api/reload — reload channel manager daemon without forcing input source switch
+            // POST api/reload — reload channel manager daemon (and Vetro TV Tuner if running) without forcing input source switch
             if ((sub === 'reload' || action === 'reload') && req.method === 'POST') {
                 withDbLock(res, function (release) {
                     var reloadScript =
                         'exec 9>' + shQuote(lockFile) + '; ' +
                         '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
                         TVS_UNIT_RESOLVE +
-                        'if [ -n "$UNIT" ]; then systemctl restart "$UNIT" </dev/null; else pkill -9 tvs-daemon || true; fi && sleep 1';
-                    ctx.execute(wrapSh(reloadScript), 8000).then(function (r) {
+                        'if [ -n "$UNIT" ]; then systemctl restart "$UNIT" </dev/null; else pkill -9 tvs-daemon || true; fi && sleep 1 && ' +
+                        VETRO_TUNER_RESTART_SH;
+                    ctx.execute(wrapSh(reloadScript), 12000).then(function (r) {
                         release();
                         if (r.exit_code === 10 || (r.stdout || '').indexOf('LOCKED') >= 0) {
                             sendJson(res, 409, { ok: false, error: 'Database lock held by another operation. Please retry.' });
@@ -1592,7 +1672,7 @@ function channelsPlugin(ctx) {
                         return;
                     }
 
-                    ctx.execute('/usr/bin/input_keyevent ' + keySym, 3000).then(function (r) {
+                    ctx.execute(buildKeyCommand(keySym), 3000).then(function (r) {
                         sendJson(res, 200, { ok: r.exit_code === 0, key: keySym });
                     }, function (e) {
                         sendJson(res, 500, { ok: false, error: e.message });
@@ -2270,7 +2350,7 @@ function channelsPlugin(ctx) {
                                     'RESTARTED=0; ' +
                                     'cleanup_start() { ' +
                                     '  rm -rf "$RB_DIR" 2>/dev/null || true; ' +
-                                    '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; fi; ' +
+                                    '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; sleep 1; ' + VETRO_TUNER_RESTART_SH + '; fi; ' +
                                     '}; ' +
                                     'trap cleanup_start EXIT; ' +
                                     'rm -rf "$RB_DIR" && mkdir -p "$RB_DIR" || { echo "RESTORE_RB_MKDIR_FAILED"; exit 13; }; ' +
@@ -2300,6 +2380,7 @@ function channelsPlugin(ctx) {
                                     'systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || { echo "START_FAILED"; exit 15; }; ' +
                                     'RESTARTED=1; ' +
                                     'sleep 1; ' +
+                                    VETRO_TUNER_RESTART_SH + '; ' +
                                     'echo "SUCCESS"';
 
                                 return ctx.execute(wrapSh(restoreScript), 25000).then(function (r) {
@@ -2361,6 +2442,9 @@ function channelsPlugin(ctx) {
 
 channelsPlugin._internals = {
     ALLOWED_KEYS: ALLOWED_KEYS,
+    TUNER_PIPE_KEYS: TUNER_PIPE_KEYS,
+    VETRO_TUNER_RESTART_SH: VETRO_TUNER_RESTART_SH,
+    buildKeyCommand: buildKeyCommand,
     ALLOWED_DBS: ALLOWED_DBS,
     MAX_IMPORT_BYTES: MAX_IMPORT_BYTES,
     MAX_UNZIP_BYTES: MAX_UNZIP_BYTES,

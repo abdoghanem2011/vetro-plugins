@@ -1093,6 +1093,156 @@ test('CORS disabled, remote key allow-list hardened, export locked, reload avoid
     assert.deepEqual(p.status(), { ok: true, count: 0, pendingReload: false });
 });
 
+test('Vetro TV Tuner integration: reload/import/restore restart tuner, CH+/CH-/Exit and tune use pipe when shown', async function (t) {
+    var env = createTempEnv(t);
+    var dbs = createTvDatabases(env.dataDir, { userVersion: 7 });
+
+    var preEditDir = path.join(env.pluginDir, 'backup', 'pre-edit');
+    fs.mkdirSync(preEditDir, { recursive: true });
+    fs.copyFileSync(dbs.dvbsPath, path.join(preEditDir, 'dvbs'));
+    fs.writeFileSync(path.join(preEditDir, 'backup-meta.json'), JSON.stringify({ createdAt: '2026-11-25T00:00:00Z', files: ['dvbs'] }));
+
+    var stagedSource = path.join(env.root, 'zip_src');
+    fs.mkdirSync(stagedSource, { recursive: true });
+    createTvDatabases(stagedSource, { userVersion: 7 });
+
+    var tunerShownSimulated = true;
+    var exec = createRealSqliteExecutor(function (cmd, timeoutMs, helpers) {
+        if (cmd.indexOf('/usr/bin/unzip -l') >= 0) {
+            return { exit_code: 0, stdout: '__LIST_START__\n  131072  2026-01-01 12:00   dvbs\n__LIST_END__\n', stderr: '' };
+        }
+        if (cmd.indexOf('/usr/bin/unzip -o -q') >= 0) {
+            var upZip = helpers.extractQuotedVar(cmd, 'UP');
+            var tDir = helpers.extractQuotedVar(cmd, 'TMP');
+            fs.mkdirSync(tDir, { recursive: true });
+            fs.copyFileSync(path.join(stagedSource, 'dvbs'), path.join(tDir, 'dvbs'));
+            try { if (fs.existsSync(upZip)) fs.unlinkSync(upZip); } catch (e) {}
+            return { exit_code: 0, stdout: '__DBS__=dvbs\n__IMP_META_START__\n__IMP_META_END__\n__TV_META_START__\n__TV_META_END__\n__PRD_START__\n__PRD_END__\n', stderr: '' };
+        }
+        if (cmd.indexOf('COPY_ROLLED_BACK') >= 0 || cmd.indexOf('RESTORE_ROLLED_BACK') >= 0) {
+            return { exit_code: 0, stdout: 'SUCCESS\n', stderr: '' };
+        }
+        if (cmd.indexOf('__METHOD__=tuner') >= 0) {
+            return { exit_code: 0, stdout: tunerShownSimulated ? '__METHOD__=tuner\n' : '__METHOD__=direct\n', stderr: '' };
+        }
+        return undefined;
+    });
+
+    // 1. Pure buildKeyCommand checks
+    var chUpWrapped = internals.buildKeyCommand('XF86RaiseChannel');
+    var chDownWrapped = internals.buildKeyCommand('XF86LowerChannel');
+    var exitWrapped = internals.buildKeyCommand('XF86Exit');
+    assert.match(chUpWrapped, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
+    assert.match(chDownWrapped, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
+    assert.match(exitWrapped, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
+    assert.ok(unwrapCmd(chUpWrapped).indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    assert.ok(unwrapCmd(chUpWrapped).indexOf("echo 'key 88'") >= 0);
+    assert.ok(unwrapCmd(chUpWrapped).indexOf('exec 3<>') >= 0);
+    assert.ok(unwrapCmd(chUpWrapped).indexOf('/usr/bin/input_keyevent XF86RaiseChannel') >= 0);
+    assert.ok(unwrapCmd(chDownWrapped).indexOf("echo 'key 87'") >= 0);
+    assert.ok(unwrapCmd(exitWrapped).indexOf("echo 'key 174'") >= 0);
+    assert.equal(internals.buildKeyCommand('XF86AudioRaiseVolume'), '/usr/bin/input_keyevent XF86AudioRaiseVolume');
+
+    var p = pluginFactory({ dir: env.pluginDir, _dataDir: env.dataDir, _tmpDir: env.tmpDir, execute: exec.execute });
+    p.start();
+    t.after(function () { p.stop(); });
+
+    // 2. api/key for ch_up, ch_down, exit executes pipe-aware script
+    for (var pair of [['ch_up', 'key 88'], ['ch_down', 'key 87'], ['exit', 'key 174']]) {
+        var logStart = exec.log.length;
+        var kr = await invokeRoute(p, { method: 'POST', sub: 'key', body: { key: pair[0] } });
+        assert.equal(kr.status, 200);
+        assert.equal(kr.json.ok, true);
+        assert.ok(exec.log[logStart].script.indexOf(pair[1]) >= 0);
+        assert.ok(exec.log[logStart].script.indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    }
+
+    // 3. Populate cachedChannels via GET api/list
+    var listRes = await invokeRoute(p, { method: 'GET', sub: 'list' });
+    assert.equal(listRes.status, 200);
+
+    // 3a. Unique visible channel (#3, srvId='103') -> uses pipe-aware tune wrapper and reports method:'tuner' when shown
+    var logTuneIdx = exec.log.length;
+    var tuneVis = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 3, srvId: '103' } });
+    assert.equal(tuneVis.status, 200);
+    assert.equal(tuneVis.json.method, 'tuner');
+    assert.ok(exec.log[logTuneIdx].script.indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    assert.ok(exec.log[logTuneIdx].script.indexOf("echo 'tune 3'") >= 0);
+    assert.ok(exec.log[logTuneIdx].script.indexOf('/usr/bin/launch_app org.tizen.tv-viewer tune_channel 103') >= 0);
+
+    // Same route falls back to 'direct' when tuner is hidden
+    tunerShownSimulated = false;
+    var tuneHiddenTuner = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 3, srvId: '103' } });
+    assert.equal(tuneHiddenTuner.json.method, 'direct');
+    tunerShownSimulated = true;
+
+    // 3b. Hidden channel (#4, srvId='104') -> skips pipe, uses direct launch_app directly
+    var logHiddenIdx = exec.log.length;
+    var tuneHidden = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 4, srvId: '104' } });
+    assert.equal(tuneHidden.status, 200);
+    assert.equal(tuneHidden.json.method, 'direct');
+    assert.equal(exec.log[logHiddenIdx].cmd, '/usr/bin/launch_app org.tizen.tv-viewer tune_channel 104');
+
+    // 3c. Duplicate visible Major (#5 exists in both dvbs srvId='5001' and ipsrv srvId='9001') -> skips pipe, uses direct launch_app
+    var logDupIdx = exec.log.length;
+    var tuneDup = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 5, srvId: '9001' } });
+    assert.equal(tuneDup.status, 200);
+    assert.equal(tuneDup.json.method, 'direct');
+    assert.equal(exec.log[logDupIdx].cmd, '/usr/bin/launch_app org.tizen.tv-viewer tune_channel 9001');
+
+    // 3d. Digit fallback without srvId -> includes /tmp/vetro-tuner.ctl.shown + 'tune 42' + D-Bus fallback
+    var logFbIdx = exec.log.length;
+    var tuneFb = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 42 } });
+    assert.equal(tuneFb.status, 200);
+    assert.equal(tuneFb.json.method, 'tuner');
+    assert.ok(exec.log[logFbIdx].script.indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    assert.ok(exec.log[logFbIdx].script.indexOf("echo 'tune 42'") >= 0);
+    assert.ok(exec.log[logFbIdx].script.indexOf('Test.EventKey') >= 0);
+
+    // 3e. pendingReload=true after an edit bypasses tuner pipe until reload completes
+    var renRes = await invokeRoute(p, { method: 'POST', sub: 'edit', body: { action: 'rename', type: 'dvbs', srvId: '103', name: 'Gamma Renamed' } });
+    assert.equal(renRes.status, 200);
+    var logPendIdx = exec.log.length;
+    var tunePending = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 3, srvId: '103' } });
+    assert.equal(tunePending.status, 200);
+    assert.equal(tunePending.json.method, 'direct');
+    assert.equal(exec.log[logPendIdx].cmd, '/usr/bin/launch_app org.tizen.tv-viewer tune_channel 103');
+
+    // 4. Reload, Phase 2 import swap, and restore-backup all include non-blocking vetro-tuner restart + quit fallback
+    var relIdx = exec.log.length;
+    var relRes = await invokeRoute(p, { method: 'POST', sub: 'reload', body: '{}' });
+    assert.equal(relRes.status, 200);
+    assert.ok(exec.log[relIdx].script.indexOf('systemctl restart --no-block vetro-tuner.service') >= 0);
+    assert.ok(exec.log[relIdx].script.indexOf("echo 'quit'") >= 0);
+
+    var impRes = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import',
+        url: '/import?name=' + encodeURIComponent('Channel_list_test.zip'),
+        headers: { 'content-type': 'text/plain' },
+        body: Buffer.from('PK_FAKE_ZIP')
+    });
+    assert.equal(impRes.status, 200);
+    var p2Logs = exec.log.filter(function (x) { return x.script.indexOf('COPY_ROLLED_BACK') >= 0; });
+    assert.equal(p2Logs.length, 1);
+    assert.ok(p2Logs[0].script.indexOf('systemctl restart --no-block vetro-tuner.service') >= 0);
+    assert.ok(p2Logs[0].script.indexOf("echo 'quit'") >= 0);
+
+    var rbRes = await invokeRoute(p, { method: 'POST', sub: 'restore-backup', body: { slot: 'pre-edit' } });
+    assert.equal(rbRes.status, 200);
+    var rbLogs = exec.log.filter(function (x) { return x.script.indexOf('RESTORE_ROLLED_BACK') >= 0; });
+    assert.equal(rbLogs.length, 1);
+    assert.ok(rbLogs[0].script.indexOf('systemctl restart --no-block vetro-tuner.service') >= 0);
+    assert.ok(rbLogs[0].script.indexOf("echo 'quit'") >= 0);
+
+    // 5. POST api/tvsource triggers resume on /tmp/vetro-tuner.ctl
+    var tvSrcIdx = exec.log.length;
+    var tvSrcRes = await invokeRoute(p, { method: 'POST', sub: 'tvsource', body: '{}' });
+    assert.equal(tvSrcRes.status, 200);
+    assert.ok(exec.log[tvSrcIdx].script.indexOf("echo 'resume'") >= 0);
+    assert.ok(exec.log[tvSrcIdx].script.indexOf('/tmp/vetro-tuner.ctl') >= 0);
+});
+
 if (process.platform !== 'win32') {
     test('POSIX sh Phase 2 swap + rollback + EXIT trap executes cleanly with stubbed systemctl', async function (t) {
         var env = createTempEnv(t);

@@ -38,8 +38,8 @@
         "exec"
       ],
       "url": "dist/channels-1.0.0.vplugin",
-      "sha256": "d7dfc7f2f5bdf40abc8f28bb8ce06058974d814635d65d35cdd09538ee887486",
-      "size": 236077
+      "sha256": "bf58fba85ab3be75bb5630b68dd908a442bd3125d59c9a62cddcbb52853289a1",
+      "size": 242506
     },
     {
       "id": "eightbitdo-guide",

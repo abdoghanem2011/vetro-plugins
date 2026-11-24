@@ -14,6 +14,7 @@ Adds a unified **Channels** tab to the Vetro dashboard:
 - **Channel Move & Reordering:** Move single or multiple channels (selected strictly by `srvId`) to a new target slot within the same source and DVB service category (TV, Radio, or Data), conserving slots without overwriting existing channels.
 - **Optional Gap Closure on Deletion:** Deleting channels marks `elim = 1` without renumbering by default. On DVB-S, an unchecked-by-default option lets you compact remaining visible channels within the edited service category (`tv` vs `radio` vs `data`) while keeping hidden channels at their slots; Samsung TV Plus (`ipsrv`) channel numbers are never compacted. Cross-DB delete and hide/unhide operations execute inside a single SQLite `ATTACH` transaction with `-bail`.
 - **Live Daemon Reload Behavior:** Edits write to SQLite on disk while Samsung's `tvs-daemon` caches the active channel table in memory. Click **🔄 Reload TV** after editing so the TV tuner picks up changes; until reloaded, remote-control edits or daemon-initiated saves can overwrite unapplied SQLite changes (an amber banner stays visible whenever edits are pending reload).
+- **Vetro TV Tuner (0.7.0+) Integration:** When Vetro's built-in **Vetro TV Tuner** (`vetro-tuner.service`) is enabled, **Reload TV**, **Import**, and **Restore Previous** automatically restart `vetro-tuner.service` (`--no-block`, with `quit` pipe fallback) so it drops its cached channel list and reconnects cleanly. When Vetro TV Tuner is currently on screen (`/tmp/vetro-tuner.ctl.shown`), `CH+`, `CH-`, `Exit`, and unambiguous live-TV tuning route through `/tmp/vetro-tuner.ctl` (`key 88` / `key 87` / `key 174` / `tune <N>`) so Vetro's banner and channel cursor stay in sync. When Vetro TV Tuner is off or hidden, everything falls back unchanged to `input_keyevent` and `launch_app tune_channel`.
 - **Non-Disruptive Reload, Import & Restore:** Reloading, importing, or restoring backups leaves your current input source undisturbed (it never forces a switch away from HDMI or streaming apps back to Broadcast TV). Use the explicit **📺 TV Mode** button whenever you want to switch to Live Broadcast TV.
 - **Instant Search, Filter & Multi-Mode Sorting:** Search across all channels by number, name, frequency, or transponder. Sort channels by number (#1-9 / #9-1) or alphabetically (A-Z / Z-A).
 - **Source & Visibility Filters:** Filter between All, 📡 Satellite, 📺 TV Plus, 🆓 FTA (Free to Air), and 🙈 Hidden channels.
@@ -41,6 +42,8 @@ Adds a unified **Channels** tab to the Vetro dashboard:
 | `echo <base64> \| base64 -d \| sh` | Runs serialized SQLite, export, reload, import validation/swap, restore, TV source, and pre-edit backup scripts cleanly through Vetro's root agent |
 | `/usr/bin/flock -n 9` | Serializes stopped-daemon swap, restore, and reload operations on `/tmp/vetro_channels_db.lock` |
 | `systemctl cat` / `stop` / `start` / `restart` `tvs_deamon.service` (fallback `tvs_daemon.service`, or `pkill -9 tvs-daemon` on reload only if unit absent) | Resolves the service unit, cleanly stops it during DB replacement, guarantees restart via shell `EXIT` trap, and restarts it on **Reload TV** |
+| `systemctl is-active` / `restart --no-block vetro-tuner.service` | Refreshes Vetro TV Tuner's cached channel list after `tvs-daemon` reloads (complete no-op when Vetro TV Tuner is not running) |
+| Non-blocking FIFO write (`exec 3<>/tmp/vetro-tuner.ctl`) | Sends `key 88` (`CH+`), `key 87` (`CH-`), `key 174` (`Exit`), `tune <N>`, `resume`, or `quit` when Vetro TV Tuner is active/on screen |
 | `cp` / `cp -p` / `mv` / `chmod` / `chown` / `wc` | Manages atomic backup rotation into `<shard-dir>/backup/`, sets root permissions on TV DBs, and verifies extracted file sizes and symlinks |
 | `rm -f .../*-wal .../*-shm` / `rm -f` / `rm -rf` / `mkdir -p` | Removes stale WAL/SHM files while the daemon is stopped and cleans staging/temp files |
 | `cat` / `grep -i "^Version="` / `head` / `cut` / `tr` | Reads TV `metadata.xml` and `/etc/prd_info.ini` version/model metadata |
@@ -66,6 +69,6 @@ None. All queries and commands execute locally on the TV.
 ## Tested Environment
 
 - **Model:** Samsung Smart TV UA50AU7000 (Tizen 6.0)
-- **Vetro Version:** Vetro 0.5.0 (Node v12.4.0)
+- **Vetro Version:** Vetro 0.5.0 (Node v12.4.0) & Vetro 0.7.0 (with Vetro TV Tuner enabled)
 
-*Note:* Tested specifically on Samsung Smart TV UA50AU7000 running Tizen 6.0 and Vetro 0.5.0; behavior on other TV models and firmware versions is untested.
+*Note:* Tested specifically on Samsung Smart TV UA50AU7000 running Tizen 6.0 with Vetro 0.5.0 and Vetro 0.7.0 (Vetro TV Tuner enabled); behavior on other TV models and firmware versions is untested.
