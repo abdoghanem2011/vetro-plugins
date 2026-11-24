@@ -55,6 +55,21 @@ function sqlPath(p) {
     return String(p).replace(/\\/g, '/').replace(/'/g, "''");
 }
 
+function getQueryParam(urlStr, key) {
+    if (!urlStr || typeof urlStr !== 'string') return '';
+    var qIdx = urlStr.indexOf('?');
+    if (qIdx < 0) return '';
+    var parts = urlStr.slice(qIdx + 1).split('&');
+    var target = key + '=';
+    for (var i = 0; i < parts.length; i++) {
+        if (parts[i].indexOf(target) === 0) {
+            var rawVal = parts[i].slice(target.length).replace(/\+/g, ' ');
+            try { return decodeURIComponent(rawVal); } catch (e) { return rawVal; }
+        }
+    }
+    return '';
+}
+
 function sendJson(res, statusCode, obj) {
     res.writeHead(statusCode || 200, {
         'content-type': 'application/json',
@@ -716,13 +731,13 @@ function runSqlFile(ctx, tmpRoot, dbPath, sqlParts, prefix, timeoutMs) {
     }
     var cmd = wrapSh('sqlite3 -bail ' + shQuote(dbPath) + ' < ' + shQuote(tmpFile) + '; RC=$?; rm -f ' + shQuote(tmpFile) + '; exit $RC');
     return ctx.execute(cmd, timeoutMs || 15000).then(function (res) {
-        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) {}
+        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) { }
         if (res.exit_code !== 0) {
             return Promise.reject(new Error('SQLite command failed on ' + dbPath + ': ' + (res.stderr || 'exit code ' + res.exit_code)));
         }
         return res;
     }, function (execErr) {
-        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) {}
+        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) { }
         return Promise.reject(execErr);
     });
 }
@@ -936,13 +951,13 @@ function channelsPlugin(ctx) {
             'echo "BACKUP_OK"';
 
         return ctx.execute(wrapSh(script), 15000).then(function (r) {
-            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
+            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) { }
             if (r.exit_code !== 0) {
                 return Promise.reject(new Error('Pre-edit backup failed (' + ((r.stdout || '').trim() || r.stderr || 'exit code ' + r.exit_code) + '); edit aborted to protect existing data.'));
             }
             return true;
         }, function (err) {
-            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
+            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) { }
             return Promise.reject(err);
         });
     }
@@ -964,7 +979,7 @@ function channelsPlugin(ctx) {
         return ctx.execute(listCmd, 12000).then(function (lr) {
             var listOut = String(lr.stdout || '');
             if (listOut.indexOf('INVALID_ZIP') >= 0 || lr.exit_code !== 0) {
-                try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) { }
                 return { errorCode: 400, error: 'The uploaded file is not a valid zip archive.' };
             }
 
@@ -973,7 +988,7 @@ function channelsPlugin(ctx) {
             var listBody = (sList >= 0 && eList > sList) ? listOut.slice(sList + 14, eList) : listOut;
             var parsedList = parseUnzipList(listBody);
             if (parsedList.error) {
-                try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) { }
                 return { errorCode: 400, error: parsedList.error };
             }
 
@@ -1105,7 +1120,7 @@ function channelsPlugin(ctx) {
                 return validateNextDb();
             });
         }).then(null, function (err) {
-            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) { }
             rmrfSync(tmpDir);
             return { errorCode: 500, error: err.message };
         });
@@ -1211,7 +1226,7 @@ function channelsPlugin(ctx) {
             'echo "SUCCESS"';
 
         return ctx.execute(wrapSh(script), 30000).then(function (r) {
-            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) {}
+            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) { }
             rmrfSync(tmpDir);
             var out = String(r.stdout || '').trim();
             if (out.indexOf('SUCCESS') >= 0 && r.exit_code === 0) {
@@ -1939,7 +1954,7 @@ function channelsPlugin(ctx) {
                         var lines = (r.stdout || '').trim().split('\n');
                         var lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : '';
                         if (r.exit_code !== 0 || lastLine === 'NO_FILES') {
-                            try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (e) {}
+                            try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (e) { }
                             sendJson(res, 500, { ok: false, error: 'Failed to generate channel backup archive' });
                             return;
                         }
@@ -1959,23 +1974,23 @@ function channelsPlugin(ctx) {
                             function cleanupZip() {
                                 if (cleaned) return;
                                 cleaned = true;
-                                try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (e) {}
+                                try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (e) { }
                             }
                             var readStream = fs.createReadStream(tmpZipPath);
                             readStream.on('close', cleanupZip);
                             readStream.on('error', function () {
                                 cleanupZip();
-                                try { res.end(); } catch (e) {}
+                                try { res.end(); } catch (e) { }
                             });
                             res.on('close', cleanupZip);
                             readStream.pipe(res);
                         } catch (fsErr) {
-                            try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (e) {}
+                            try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (e) { }
                             sendJson(res, 500, { ok: false, error: 'Backup archive could not be read: ' + fsErr.message });
                         }
                     }, function (e) {
                         release();
-                        try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (ex) {}
+                        try { if (fs.existsSync(tmpZipPath)) fs.unlinkSync(tmpZipPath); } catch (ex) { }
                         sendJson(res, 500, { ok: false, error: e.message });
                     });
                 });
@@ -1992,12 +2007,13 @@ function channelsPlugin(ctx) {
                         return;
                     }
 
-                    var rawHeaderName = req.headers && req.headers['x-upload-filename'] ? String(req.headers['x-upload-filename']) : '';
-                    var decodedHeaderName = rawHeaderName;
-                    if (rawHeaderName) {
-                        try { decodedHeaderName = decodeURIComponent(rawHeaderName); } catch (e) { decodedHeaderName = rawHeaderName; }
+                    var queryName = getQueryParam(req.url, 'name') || getQueryParam(sub, 'name');
+                    var decodedName = queryName;
+                    if (!decodedName && req.headers && req.headers['x-upload-filename']) {
+                        var rawHeaderName = String(req.headers['x-upload-filename']);
+                        try { decodedName = decodeURIComponent(rawHeaderName); } catch (e) { decodedName = rawHeaderName; }
                     }
-                    var sourceName = sanitizeFileName(decodedHeaderName);
+                    var sourceName = sanitizeFileName(decodedName);
                     var importId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
                     var uploadZip = path.join(tmpRoot, 'ch_up_' + importId + '.zip');
                     var tmpDir = path.join(tmpRoot, 'ch_imp_' + importId);
@@ -2018,7 +2034,7 @@ function channelsPlugin(ctx) {
                         settled = true;
 
                         if (typeof req.unpipe === 'function') {
-                            try { req.unpipe(outStream); } catch (e) {}
+                            try { req.unpipe(outStream); } catch (e) { }
                         }
 
                         var finalized = false;
@@ -2026,14 +2042,14 @@ function channelsPlugin(ctx) {
                             if (finalized) return;
                             finalized = true;
                             activeFinalize = null;
-                            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) { }
                             release();
                             if (destroyReqAfterRes && typeof req.destroy === 'function') {
                                 if (res.writableEnded || res.finished) {
-                                    try { req.destroy(); } catch (e) {}
+                                    try { req.destroy(); } catch (e) { }
                                 } else {
                                     res.once('finish', function () {
-                                        try { req.destroy(); } catch (e) {}
+                                        try { req.destroy(); } catch (e) { }
                                     });
                                 }
                             }
@@ -2046,12 +2062,12 @@ function channelsPlugin(ctx) {
                         if (outClosed || immediate) {
                             if (!outClosed) {
                                 outStream.once('close', function () {
-                                    try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                                    try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) { }
                                 });
                                 if (typeof outStream.destroy === 'function') {
-                                    try { outStream.destroy(); } catch (e) {}
+                                    try { outStream.destroy(); } catch (e) { }
                                 } else if (typeof outStream.end === 'function') {
-                                    try { outStream.end(); } catch (e) {}
+                                    try { outStream.end(); } catch (e) { }
                                 }
                             }
                             finalizeCleanup();
@@ -2142,7 +2158,7 @@ function channelsPlugin(ctx) {
                                 }
                             });
                         }, function (err) {
-                            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) {}
+                            try { if (fs.existsSync(uploadZip)) fs.unlinkSync(uploadZip); } catch (e) { }
                             rmrfSync(tmpDir);
                             release();
                             sendJson(res, 500, { ok: false, error: err.message });

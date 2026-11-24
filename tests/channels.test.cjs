@@ -41,7 +41,7 @@ function createTempEnv(t) {
     fs.mkdirSync(tmpDir, { recursive: true });
     if (t && typeof t.after === 'function') {
         t.after(function () {
-            try { fs.rmSync(root, { recursive: true, force: true }); } catch (e) {}
+            try { fs.rmSync(root, { recursive: true, force: true }); } catch (e) { }
         });
     }
     return { root: root, pluginDir: pluginDir, dataDir: dataDir, tmpDir: tmpDir };
@@ -203,7 +203,7 @@ function createRealSqliteExecutor(customHandler) {
             var sqlFile = fileMatch[2].replace(/'\\''/g, "'");
             var sqlText = fs.readFileSync(sqlFile, 'utf8');
             var fRes = cp.spawnSync(SQLITE_BIN, ['-bail', fDb], { input: sqlText, encoding: 'utf8' });
-            try { if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile); } catch (e) {}
+            try { if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile); } catch (e) { }
             return Promise.resolve({
                 exit_code: fRes.status == null ? 1 : fRes.status,
                 stdout: String(fRes.stdout || '').replace(/\r\n/g, '\n'),
@@ -250,29 +250,29 @@ function createRealSqliteExecutor(customHandler) {
             var targets = forM ? forM[1].trim().split(/\s+/).map(function (x) { return x.replace(/'/g, ''); }) : [];
             var existing = targets.filter(function (f) { return fs.existsSync(path.join(bDataDir, f)); });
             if (existing.length === 0) {
-                try { if (fs.existsSync(bMeta)) fs.unlinkSync(bMeta); } catch (e) {}
+                try { if (fs.existsSync(bMeta)) fs.unlinkSync(bMeta); } catch (e) { }
                 return Promise.resolve({ exit_code: 0, stdout: 'BACKUP_SKIP\n', stderr: '' });
             }
             fs.mkdirSync(bBase, { recursive: true });
             var newDir = bSlot + '.new';
             var oldDir = bSlot + '.old';
-            try { fs.rmSync(newDir, { recursive: true, force: true }); } catch (e) {}
-            try { fs.rmSync(oldDir, { recursive: true, force: true }); } catch (e) {}
+            try { fs.rmSync(newDir, { recursive: true, force: true }); } catch (e) { }
+            try { fs.rmSync(oldDir, { recursive: true, force: true }); } catch (e) { }
             fs.mkdirSync(newDir, { recursive: true });
             for (var bi = 0; bi < existing.length; bi++) {
                 var fname = existing[bi];
                 var bkRes = cp.spawnSync(SQLITE_BIN, ['-bail', path.join(bDataDir, fname), ".backup '" + sqlForward(path.join(newDir, fname)) + "'"], { encoding: 'utf8' });
                 if (bkRes.status !== 0) {
-                    try { fs.rmSync(newDir, { recursive: true, force: true }); } catch (e) {}
-                    try { if (fs.existsSync(bMeta)) fs.unlinkSync(bMeta); } catch (e) {}
+                    try { fs.rmSync(newDir, { recursive: true, force: true }); } catch (e) { }
+                    try { if (fs.existsSync(bMeta)) fs.unlinkSync(bMeta); } catch (e) { }
                     return Promise.resolve({ exit_code: 13, stdout: 'BACKUP_SQLITE_FAILED_' + fname + '\n', stderr: bkRes.stderr || '' });
                 }
             }
             fs.copyFileSync(bMeta, path.join(newDir, 'backup-meta.json'));
-            try { fs.unlinkSync(bMeta); } catch (e) {}
+            try { fs.unlinkSync(bMeta); } catch (e) { }
             if (fs.existsSync(bSlot)) fs.renameSync(bSlot, oldDir);
             fs.renameSync(newDir, bSlot);
-            try { fs.rmSync(oldDir, { recursive: true, force: true }); } catch (e) {}
+            try { fs.rmSync(oldDir, { recursive: true, force: true }); } catch (e) { }
             return Promise.resolve({ exit_code: 0, stdout: 'BACKUP_OK\n', stderr: '' });
         }
 
@@ -313,8 +313,8 @@ function invokeRoute(plugin, opts) {
             write: function (chunk) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))); return true; },
             once: function (ev, fn) { if (listeners[ev]) listeners[ev].push(fn); },
             on: function (ev, fn) { if (listeners[ev]) listeners[ev].push(fn); },
-            removeListener: function () {},
-            emit: function () {},
+            removeListener: function () { },
+            emit: function () { },
             end: function (chunk) {
                 if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
                 if (finished) return;
@@ -325,7 +325,7 @@ function invokeRoute(plugin, opts) {
                 for (var fi = 0; fi < finishListeners.length; fi++) finishListeners[fi]();
                 var raw = Buffer.concat(chunks).toString('utf8');
                 var json = null;
-                try { json = JSON.parse(raw); } catch (e) {}
+                try { json = JSON.parse(raw); } catch (e) { }
                 resolve({ handled: true, status: statusCode, headers: resHeaders, body: raw, json: json });
             }
         };
@@ -678,7 +678,7 @@ function createRouteHttpServer(plugin, t) {
             var addr = server.address();
             if (t && typeof t.after === 'function') {
                 t.after(function () {
-                    try { server.close(); } catch (e) {}
+                    try { server.close(); } catch (e) { }
                 });
             }
             resolve({ server: server, port: addr.port });
@@ -787,7 +787,7 @@ test('two-phase import stages mismatches for explicit confirmation, cleans on ca
             fs.mkdirSync(tDir, { recursive: true });
             fs.copyFileSync(path.join(stagedSource, 'dvbs'), path.join(tDir, 'dvbs'));
             fs.copyFileSync(path.join(stagedSource, 'sat'), path.join(tDir, 'sat'));
-            try { if (fs.existsSync(upZip)) fs.unlinkSync(upZip); } catch (e) {}
+            try { if (fs.existsSync(upZip)) fs.unlinkSync(upZip); } catch (e) { }
             return {
                 exit_code: 0,
                 stdout: [
@@ -820,7 +820,8 @@ test('two-phase import stages mismatches for explicit confirmation, cleans on ca
     var up1 = await invokeRoute(p, {
         method: 'POST',
         sub: 'import',
-        headers: { 'x-upload-filename': 'Channel_list_T-MISMATCH-1000.zip' },
+        url: '/import?name=' + encodeURIComponent('Channel_list_T-MISMATCH-1000.zip'),
+        headers: { 'content-type': 'text/plain' },
         body: Buffer.from('PK_FAKE_ZIP')
     });
     assert.equal(up1.status, 200);
@@ -844,7 +845,8 @@ test('two-phase import stages mismatches for explicit confirmation, cleans on ca
     var up2 = await invokeRoute(p, {
         method: 'POST',
         sub: 'import',
-        headers: { 'x-upload-filename': 'Channel_list_T-MISMATCH-1000.zip' },
+        url: '/import?name=' + encodeURIComponent('Channel_list_T-MISMATCH-1000.zip'),
+        headers: { 'content-type': 'text/plain' },
         body: Buffer.from('PK_FAKE_ZIP')
     });
     assert.equal(up2.json.needsConfirm, true);
@@ -890,7 +892,7 @@ test('B4: timed-out Phase 2 swap never deletes tmpDir from Node or spawns a comp
             var tDir = helpers.extractQuotedVar(cmd, 'TMP');
             fs.mkdirSync(tDir, { recursive: true });
             fs.copyFileSync(path.join(stagedSource, 'dvbs'), path.join(tDir, 'dvbs'));
-            try { if (fs.existsSync(upZip)) fs.unlinkSync(upZip); } catch (e) {}
+            try { if (fs.existsSync(upZip)) fs.unlinkSync(upZip); } catch (e) { }
             return { exit_code: 0, stdout: '__DBS__= dvbs\n', stderr: '' };
         }
         if (cmd.indexOf('COPY_ROLLED_BACK') >= 0) {
@@ -1080,6 +1082,8 @@ test('CORS disabled, remote key allow-list hardened, export locked, reload avoid
     assert.ok(uiRes.body.indexOf('data-key="') >= 0);
     assert.ok(uiRes.body.indexOf('<meta name="color-scheme" content="dark">') >= 0);
     assert.ok(uiRes.body.indexOf('hrefParts.slice(1)') >= 0);
+    assert.equal(uiRes.body.indexOf('X-Upload-Filename'), -1);
+    assert.ok(uiRes.body.indexOf("fetch('import?name='") >= 0);
 
     // stop() clears state cleanly
     p.stop();

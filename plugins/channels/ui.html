@@ -2690,9 +2690,9 @@
         isImporting = true;
         showToast('⏳ Uploading and validating archive…', 6000);
 
-        fetch('import', {
+        fetch('import?name=' + encodeURIComponent(file.name), {
           method: 'POST',
-          headers: { 'X-Upload-Filename': encodeURIComponent(file.name) },
+          headers: { 'Content-Type': 'text/plain' },
           body: file
         })
         .then(function (res) { return res.json(); })
