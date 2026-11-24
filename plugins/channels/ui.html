@@ -2679,10 +2679,25 @@
       var file = fileImportInput.files && fileImportInput.files[0];
       if (!file) return;
 
-      var sizeKb = Math.round(file.size / 1024);
+      var MAX_IMPORT_BYTES = 15 * 1024 * 1024;
+      if (!file.size) {
+        fileImportInput.value = '';
+        showToast('⚠️ Selected archive is empty.', 3500);
+        return;
+      }
+      if (file.size > MAX_IMPORT_BYTES) {
+        var sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+        fileImportInput.value = '';
+        showToast('⚠️ Archive is too large (' + sizeMb + ' MB). Maximum allowed size is 15 MB.', 4500);
+        return;
+      }
+
+      var sizeLabel = file.size >= 1024 * 1024
+        ? (file.size / (1024 * 1024)).toFixed(1) + ' MB'
+        : Math.max(1, Math.round(file.size / 1024)) + ' KB';
       showConfirmModal({
         title: 'Import Channel Backup?',
-        message: 'Validate and import "' + file.name + '" (' + sizeKb + ' KB)? Existing TV databases will be backed up before replacing.',
+        message: 'Validate and import "' + file.name + '" (' + sizeLabel + ')? Existing TV databases will be backed up before replacing.',
         confirmText: 'Validate & Import',
         danger: false,
         icon: '📥'

@@ -703,6 +703,7 @@ test('B1: >15 MB upload (header + streamed) and client abort always release dbBu
         manualStream: true
     });
     assert.equal(overLenRes.status, 413);
+    assert.equal(overLenRes.headers['connection'], 'close');
     assert.equal(fs.readdirSync(env.tmpDir).filter(function (n) { return n.indexOf('ch_up_') === 0; }).length, 0);
 
     // Lock must be free
@@ -1084,6 +1085,8 @@ test('CORS disabled, remote key allow-list hardened, export locked, reload avoid
     assert.ok(uiRes.body.indexOf('hrefParts.slice(1)') >= 0);
     assert.equal(uiRes.body.indexOf('X-Upload-Filename'), -1);
     assert.ok(uiRes.body.indexOf("fetch('import?name='") >= 0);
+    assert.ok(uiRes.body.indexOf('MAX_IMPORT_BYTES') >= 0);
+    assert.ok(uiRes.body.indexOf('file.size > MAX_IMPORT_BYTES') >= 0);
 
     // stop() clears state cleanly
     p.stop();

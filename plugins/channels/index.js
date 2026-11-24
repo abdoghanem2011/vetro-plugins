@@ -70,11 +70,18 @@ function getQueryParam(urlStr, key) {
     return '';
 }
 
-function sendJson(res, statusCode, obj) {
-    res.writeHead(statusCode || 200, {
+function sendJson(res, statusCode, obj, extraHeaders) {
+    var headers = {
         'content-type': 'application/json',
         'cache-control': 'no-store'
-    });
+    };
+    if (extraHeaders) {
+        var ks = Object.keys(extraHeaders);
+        for (var i = 0; i < ks.length; i++) {
+            headers[ks[i]] = extraHeaders[ks[i]];
+        }
+    }
+    res.writeHead(statusCode || 200, headers);
     res.end(JSON.stringify(obj));
 }
 
@@ -2003,7 +2010,7 @@ function channelsPlugin(ctx) {
                     var contentLen = parseInt(req.headers && req.headers['content-length'], 10);
                     if (!isNaN(contentLen) && contentLen > MAX_IMPORT_BYTES) {
                         release();
-                        sendJson(res, 413, { ok: false, error: 'Archive exceeds 15 MB limit.' });
+                        sendJson(res, 413, { ok: false, error: 'Archive exceeds 15 MB limit.' }, { 'connection': 'close' });
                         return;
                     }
 
@@ -2054,7 +2061,7 @@ function channelsPlugin(ctx) {
                                 }
                             }
                             if (!res.headersSent) {
-                                sendJson(res, statusCode, { ok: false, error: errMsg });
+                                sendJson(res, statusCode, { ok: false, error: errMsg }, statusCode === 413 ? { 'connection': 'close' } : null);
                             }
                         }
                         activeFinalize = finalizeCleanup;
