@@ -153,30 +153,82 @@ function readJson(req, maxBytes, callback) {
     req.on('error', onError);
 }
 
-function computeChannelMoves(allChannels, selectedNums, target) {
-    var selectedSet = {};
-    for (var i = 0; i < selectedNums.length; i++) {
-        selectedSet[selectedNums[i]] = true;
+function parseSrvIdList(arr) {
+    var out = [];
+    var seen = createDict();
+    if (!Array.isArray(arr)) return out;
+    for (var i = 0; i < arr.length; i++) {
+        var raw = arr[i] != null ? String(arr[i]).trim() : '';
+        if (raw && SRVID_RE.test(raw) && !hasOwn(seen, raw)) {
+            seen[raw] = true;
+            out.push(raw);
+        }
+    }
+    return out;
+}
+
+// Reorder channels strictly by srvId while conserving slot count and optionally scoping
+// displacement to a single DVB service category (TV vs Radio vs Data).
+function computeChannelMoves(allChannels, selectedSrvIds, target, scopeByCategory) {
+    var selectedSet = createDict();
+    var validIds = parseSrvIdList(selectedSrvIds);
+    for (var i = 0; i < validIds.length; i++) {
+        selectedSet[validIds[i]] = true;
+    }
+
+    var matchedSelected = [];
+    for (var j = 0; j < allChannels.length; j++) {
+        var ch = allChannels[j];
+        if (selectedSet[ch.srvId]) {
+            matchedSelected.push(ch);
+        }
+    }
+
+    var k = matchedSelected.length;
+    if (k === 0) return { error: 'No matching channels selected' };
+    if (isNaN(target) || target < 1 || target > 9999) {
+        return { error: 'Target channel number must be between 1 and 9999' };
+    }
+    if (target + k - 1 > 9999) {
+        return { error: 'Target range would exceed maximum channel number 9999' };
+    }
+
+    var targetCat = null;
+    if (scopeByCategory) {
+        targetCat = getServiceCategory(matchedSelected[0].srvType);
+        for (var ci = 1; ci < matchedSelected.length; ci++) {
+            if (getServiceCategory(matchedSelected[ci].srvType) !== targetCat) {
+                return { error: 'Selected channels mix different service types (TV, Radio, or Data). Select one category to move.' };
+            }
+        }
+    }
+
+    var poolChannels = [];
+    for (var pi = 0; pi < allChannels.length; pi++) {
+        var item = allChannels[pi];
+        if (!scopeByCategory || getServiceCategory(item.srvType) === targetCat) {
+            poolChannels.push(item);
+        }
     }
 
     var selected = [];
     var unselected = [];
-    for (var j = 0; j < allChannels.length; j++) {
-        var ch = allChannels[j];
-        if (selectedSet[ch.major]) {
-            selected.push(ch);
+    for (var si = 0; si < poolChannels.length; si++) {
+        var pc = poolChannels[si];
+        if (selectedSet[pc.srvId]) {
+            selected.push(pc);
         } else {
-            unselected.push(ch);
+            unselected.push(pc);
         }
     }
 
-    selected.sort(function (a, b) { return a.major - b.major; });
-    unselected.sort(function (a, b) { return a.major - b.major; });
-    var k = selected.length;
+    function sortByMajorThenSrv(a, b) {
+        if (a.major !== b.major) return a.major - b.major;
+        return a.srvId < b.srvId ? -1 : (a.srvId > b.srvId ? 1 : 0);
+    }
 
-    if (k === 0) return { error: 'No channels selected' };
-    if (isNaN(target) || target < 1 || target > 9999) return { error: 'Target channel number must be between 1 and 9999' };
-    if (target + k - 1 > 9999) return { error: 'Target range would exceed maximum channel number 9999' };
+    selected.sort(sortByMajorThenSrv);
+    unselected.sort(sortByMajorThenSrv);
 
     var currentSelectedNums = [];
     var targetSlots = [];
@@ -193,13 +245,14 @@ function computeChannelMoves(allChannels, selectedNums, target) {
         }
     }
     if (isAlready) {
-        return { error: 'Selected channel(s) already occupy #' + target + (k > 1 ? (' - #' + (target + k - 1)) : '') };
+        return {
+            error: 'Selected channel(s) already occupy #' + target + (k > 1 ? (' - #' + (target + k - 1)) : '')
+        };
     }
 
-    var allSorted = allChannels.slice().sort(function (a, b) { return a.major - b.major; });
+    var allSorted = poolChannels.slice().sort(sortByMajorThenSrv);
     var maxOrig = allSorted.length > 0 ? allSorted[allSorted.length - 1].major : 0;
 
-    // If moving beyond the max existing channel number into open space:
     if (target > maxOrig) {
         var simpleChanges = [];
         for (var p = 0; p < k; p++) {
@@ -215,16 +268,14 @@ function computeChannelMoves(allChannels, selectedNums, target) {
     var minInvolved = Math.min(currentSelectedNums[0], target);
     var maxInvolved = Math.max(currentSelectedNums[currentSelectedNums.length - 1], target + k - 1);
 
-    var involved = [];
     var involvedUnselected = [];
-    var occupiedSlotsMap = {};
+    var occupiedSlotsMap = createDict();
 
     for (var q = 0; q < allSorted.length; q++) {
         var cItem = allSorted[q];
         if (cItem.major >= minInvolved && cItem.major <= maxInvolved) {
-            involved.push(cItem);
             occupiedSlotsMap[cItem.major] = true;
-            if (!selectedSet[cItem.major]) {
+            if (!selectedSet[cItem.srvId]) {
                 involvedUnselected.push(cItem);
             }
         }
@@ -234,15 +285,12 @@ function computeChannelMoves(allChannels, selectedNums, target) {
         occupiedSlotsMap[targetSlots[tIdx]] = true;
     }
 
-    var occupiedSlots = [];
-    for (var slotStr in occupiedSlotsMap) {
-        if (occupiedSlotsMap.hasOwnProperty(slotStr)) {
-            occupiedSlots.push(parseInt(slotStr, 10));
-        }
-    }
+    var occupiedSlots = Object.keys(occupiedSlotsMap).map(function (s) {
+        return parseInt(s, 10);
+    });
     occupiedSlots.sort(function (a, b) { return a - b; });
 
-    var targetSlotsSet = {};
+    var targetSlotsSet = createDict();
     for (var ts = 0; ts < targetSlots.length; ts++) {
         targetSlotsSet[targetSlots[ts]] = true;
     }
@@ -254,7 +302,7 @@ function computeChannelMoves(allChannels, selectedNums, target) {
         }
     }
 
-    var newAssignments = {};
+    var newAssignments = createDict();
     for (var sIdx = 0; sIdx < selected.length; sIdx++) {
         newAssignments[selected[sIdx].srvId] = targetSlots[sIdx];
     }
@@ -267,7 +315,7 @@ function computeChannelMoves(allChannels, selectedNums, target) {
     var changes = [];
     for (var aIdx = 0; aIdx < allSorted.length; aIdx++) {
         var curCh = allSorted[aIdx];
-        if (newAssignments.hasOwnProperty(curCh.srvId) && newAssignments[curCh.srvId] !== curCh.major) {
+        if (hasOwn(newAssignments, curCh.srvId) && newAssignments[curCh.srvId] !== curCh.major) {
             changes.push({
                 srvId: curCh.srvId,
                 oldMajor: curCh.major,
@@ -279,113 +327,132 @@ function computeChannelMoves(allChannels, selectedNums, target) {
     return { changes: changes };
 }
 
-function deleteAndCompactDb(ctx, dbPath, delSet) {
-    return new Promise(function (resolve, reject) {
-        ctx.execute('sqlite3 ' + dbPath + ' "SELECT srvId, major FROM SRV WHERE elim = 0 ORDER BY major ASC;"', 10000)
-            .then(function (qRes) {
-                if (qRes.exit_code !== 0) {
-                    return reject(new Error('Failed to query channels from ' + dbPath + ': ' + (qRes.stderr || 'exit code ' + qRes.exit_code)));
-                }
+// Build pure deletion + optional category-scoped gap closure plan.
+// Matches rows strictly by srvId (never major) and preserves hidden channel numbers.
+function planDeleteAndCompact(dbChannels, delSrvIdSet, options) {
+    var allowCompact = !!(options && options.allowCompact);
+    var compact = !!(options && options.compact);
 
-                var lines = (qRes.stdout || '').split('\n');
-                var dbChannels = [];
-                for (var i = 0; i < lines.length; i++) {
-                    var line = lines[i].trim();
-                    if (!line) continue;
-                    var parts = line.split('|');
-                    if (parts.length >= 2) {
-                        var m = parseInt(parts[1], 10);
-                        if (!isNaN(m) && m > 0) {
-                            dbChannels.push({
-                                srvId: parts[0],
-                                major: m
-                            });
-                        }
+    var toDelete = [];
+    var toKeep = [];
+    for (var j = 0; j < dbChannels.length; j++) {
+        var ch = dbChannels[j];
+        if (hasOwn(delSrvIdSet, ch.srvId)) {
+            toDelete.push(ch);
+        } else {
+            toKeep.push(ch);
+        }
+    }
+
+    if (toDelete.length === 0) {
+        return { toDelete: [], changes: [], remaining: dbChannels.length };
+    }
+
+    var changes = [];
+    if (allowCompact && compact) {
+        var affectedCats = createDict();
+        for (var di = 0; di < toDelete.length; di++) {
+            affectedCats[getServiceCategory(toDelete[di].srvType)] = true;
+        }
+
+        var catNames = Object.keys(affectedCats);
+        for (var ci = 0; ci < catNames.length; ci++) {
+            var cat = catNames[ci];
+            var minBefore = null;
+            for (var bi = 0; bi < dbChannels.length; bi++) {
+                var row = dbChannels[bi];
+                if (getServiceCategory(row.srvType) === cat && !row.hidden) {
+                    if (minBefore === null || row.major < minBefore) {
+                        minBefore = row.major;
                     }
                 }
+            }
 
-                if (dbChannels.length === 0) {
-                    return resolve({ deleted: 0, shifted: 0, remaining: 0 });
+            var visibleKeep = [];
+            var reservedHidden = createDict();
+            for (var ki = 0; ki < toKeep.length; ki++) {
+                var kRow = toKeep[ki];
+                if (getServiceCategory(kRow.srvType) !== cat) continue;
+                if (kRow.hidden) {
+                    reservedHidden[kRow.major] = true;
+                } else {
+                    visibleKeep.push(kRow);
                 }
+            }
 
-                var toDelete = [];
-                var toKeep = [];
-                for (var j = 0; j < dbChannels.length; j++) {
-                    var ch = dbChannels[j];
-                    if (delSet[ch.major] || delSet[ch.srvId]) {
-                        toDelete.push(ch);
-                    } else {
-                        toKeep.push(ch);
-                    }
+            // Main DVB TV list compacts from 1; Radio/Data keep their pool start (or 1 if starting at 1).
+            var nextMajor = (cat === 'tv' || minBefore === null || minBefore < 1) ? 1 : minBefore;
+            for (var vi = 0; vi < visibleKeep.length; vi++) {
+                while (reservedHidden[nextMajor]) {
+                    nextMajor++;
                 }
-
-                if (toDelete.length === 0) {
-                    return resolve({ deleted: 0, shifted: 0, remaining: dbChannels.length });
-                }
-
-                var changes = [];
-                for (var k = 0; k < toKeep.length; k++) {
-                    var newMajor = k + 1;
-                    if (toKeep[k].major !== newMajor) {
-                        changes.push({
-                            srvId: toKeep[k].srvId,
-                            oldMajor: toKeep[k].major,
-                            newMajor: newMajor
-                        });
-                    }
-                }
-
-                var delSrvIds = [];
-                for (var d = 0; d < toDelete.length; d++) {
-                    delSrvIds.push(toDelete[d].srvId);
-                }
-
-                var sqlParts = [
-                    '.bail on',
-                    '.timeout 5000',
-                    'PRAGMA busy_timeout = 5000;',
-                    'BEGIN TRANSACTION;'
-                ];
-                sqlParts.push('UPDATE SRV SET elim = 1, hidden = 1, hideGuide = 1, numSel = 0, major = 0 WHERE srvId IN (' + delSrvIds.join(',') + ');');
-
-                if (changes.length > 0) {
-                    var caseClauses = [];
-                    var changeSrvIds = [];
-                    for (var c = 0; c < changes.length; c++) {
-                        caseClauses.push('WHEN ' + changes[c].srvId + ' THEN ' + changes[c].newMajor);
-                        changeSrvIds.push(changes[c].srvId);
-                    }
-                    sqlParts.push('UPDATE SRV SET major = CASE srvId ' + caseClauses.join(' ') + ' END, modifiedByUser = 1 WHERE srvId IN (' + changeSrvIds.join(',') + ');');
-                }
-
-                sqlParts.push('COMMIT;');
-                sqlParts.push('PRAGMA wal_checkpoint(TRUNCATE);');
-
-                var fullSql = sqlParts.join('\n');
-                var tmpFile = '/tmp/ch_del_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6) + '.sql';
-
-                try {
-                    fs.writeFileSync(tmpFile, fullSql, 'utf8');
-                } catch (fsErr) {
-                    return reject(new Error('Failed to write temp SQL file: ' + fsErr.message));
-                }
-
-                var cmd = 'sqlite3 ' + dbPath + ' < ' + tmpFile + '; rm -f ' + tmpFile + ';';
-                ctx.execute(cmd, 15000)
-                    .then(function (res) {
-                        if (res.exit_code !== 0) {
-                            return reject(new Error('Failed to execute delete & compact on ' + dbPath + ': ' + (res.stderr || 'exit code ' + res.exit_code)));
-                        }
-                        resolve({
-                            deleted: toDelete.length,
-                            shifted: changes.length,
-                            remaining: toKeep.length
-                        });
-                    }, function (execErr) {
-                        try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
-                        reject(execErr);
+                if (visibleKeep[vi].major !== nextMajor) {
+                    changes.push({
+                        srvId: visibleKeep[vi].srvId,
+                        oldMajor: visibleKeep[vi].major,
+                        newMajor: nextMajor
                     });
-            }, reject);
+                }
+                nextMajor++;
+            }
+        }
+    }
+
+    return {
+        toDelete: toDelete,
+        changes: changes,
+        remaining: toKeep.length
+    };
+}
+
+function queryChannelsForEdit(ctx, dbPath, defaultSrvType) {
+    var sql = 'PRAGMA busy_timeout = 5000; SELECT srvId, major, IFNULL(srvType, ' + defaultSrvType + '), IFNULL(hidden, 0) FROM SRV WHERE elim = 0 ORDER BY major ASC, srvId ASC;';
+    var cmd = 'sqlite3 -bail ' + shQuote(dbPath) + ' ' + shQuote(sql);
+    return ctx.execute(cmd, 10000).then(function (qRes) {
+        if (qRes.exit_code !== 0) {
+            return Promise.reject(new Error('Failed to query channels from ' + dbPath + ': ' + (qRes.stderr || 'exit code ' + qRes.exit_code)));
+        }
+        var lines = (qRes.stdout || '').split('\n');
+        var rows = [];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line) continue;
+            var parts = line.split('|');
+            if (parts.length < 2) continue;
+            var srvIdStr = String(parts[0]).trim();
+            var m = parseInt(parts[1], 10);
+            var srvType = parts.length >= 3 ? parseInt(parts[2], 10) : defaultSrvType;
+            var isHidden = parts.length >= 4 ? (String(parts[3]).trim() === '1') : false;
+            if (SRVID_RE.test(srvIdStr) && !isNaN(m) && m > 0) {
+                rows.push({
+                    srvId: srvIdStr,
+                    major: m,
+                    srvType: isNaN(srvType) ? defaultSrvType : srvType,
+                    hidden: isHidden
+                });
+            }
+        }
+        return rows;
+    });
+}
+
+function runSqlFile(ctx, tmpRoot, dbPath, sqlParts, prefix, timeoutMs) {
+    var tmpFile = path.join(tmpRoot, prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6) + '.sql');
+    try {
+        fs.writeFileSync(tmpFile, sqlParts.join('\n'), 'utf8');
+    } catch (fsErr) {
+        return Promise.reject(new Error('Failed to write temp SQL file: ' + fsErr.message));
+    }
+    var cmd = 'sqlite3 -bail ' + shQuote(dbPath) + ' < ' + shQuote(tmpFile) + '; RC=$?; rm -f ' + shQuote(tmpFile) + '; exit $RC';
+    return ctx.execute(cmd, timeoutMs || 15000).then(function (res) {
+        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) {}
+        if (res.exit_code !== 0) {
+            return Promise.reject(new Error('SQLite command failed on ' + dbPath + ': ' + (res.stderr || 'exit code ' + res.exit_code)));
+        }
+        return res;
+    }, function (execErr) {
+        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) {}
+        return Promise.reject(execErr);
     });
 }
 
@@ -424,6 +491,7 @@ module.exports = function (ctx) {
     var cachedChannels = null;
     var lastFetchTime = 0;
     var dbBusy = false;
+    var pendingReload = false;
     var dataDir = (ctx && ctx._dataDir) ? String(ctx._dataDir) : DEFAULT_DATA_DIR;
     var tmpRoot = (ctx && ctx._tmpDir) ? String(ctx._tmpDir) : DEFAULT_TMP_DIR;
     var lockFile = path.join(tmpRoot, 'vetro_channels_db.lock');
@@ -579,12 +647,14 @@ module.exports = function (ctx) {
             cachedChannels = null;
             lastFetchTime = 0;
             dbBusy = false;
+            pendingReload = false;
         },
 
         status: function () {
             return {
                 ok: true,
-                count: cachedChannels ? cachedChannels.length : 0
+                count: cachedChannels ? cachedChannels.length : 0,
+                pendingReload: pendingReload
             };
         },
 
@@ -603,13 +673,13 @@ module.exports = function (ctx) {
             if (action === 'list' && req.method === 'GET') {
                 var forceRefresh = req.url && req.url.indexOf('refresh=1') >= 0;
                 if (!forceRefresh && cachedChannels && (Date.now() - lastFetchTime < 3000)) {
-                    sendJson(res, 200, { ok: true, channels: cachedChannels });
+                    sendJson(res, 200, { ok: true, channels: cachedChannels, pendingReload: pendingReload });
                     return true;
                 }
 
                 queryDatabase()
                     .then(function (channels) {
-                        sendJson(res, 200, { ok: true, channels: channels });
+                        sendJson(res, 200, { ok: true, channels: channels, pendingReload: pendingReload });
                     }, function (err) {
                         sendJson(res, 500, { ok: false, error: err.message });
                     });
@@ -625,7 +695,7 @@ module.exports = function (ctx) {
                     }
 
                     var channel = parseInt(parsed.channel, 10);
-                    var srvId = parsed.srvId ? String(parsed.srvId).trim() : null;
+                    var srvId = parsed.srvId != null ? String(parsed.srvId).trim() : null;
                     var forceTv = !!parsed.forceTv;
 
                     // If srvId wasn't provided in the request body, look it up in cachedChannels
@@ -716,7 +786,8 @@ module.exports = function (ctx) {
                             return;
                         }
                         cachedChannels = null;
-                        sendJson(res, 200, { ok: true });
+                        pendingReload = false;
+                        sendJson(res, 200, { ok: true, pendingReload: pendingReload });
                     }, function (e) {
                         release();
                         sendJson(res, 500, { ok: false, error: e.message });
@@ -751,171 +822,178 @@ module.exports = function (ctx) {
                 return true;
             }
 
-            // POST api/edit — manage channel flags (hide, unhide, delete, move, rename)
+            // POST api/edit — manage channels strictly by srvId (hide, unhide, delete, move, rename)
             if ((sub === 'edit' || action === 'edit') && req.method === 'POST') {
                 readJson(req, 65536, function (err, parsed) {
                     if (err) {
-                        res.writeHead(400, { 'content-type': 'application/json' });
-                        res.end(JSON.stringify({ ok: false, error: err.message }));
+                        sendJson(res, 400, { ok: false, error: err.message });
                         return;
                     }
 
                     withDbLock(res, function (release) {
                         var editAction = parsed.action;
-                        var dvbsChannels = [];
-                        var ipsrvChannels = [];
+                        var dvbsSrvIds = [];
+                        var ipsrvSrvIds = [];
 
-                        if (Array.isArray(parsed.dvbs) || Array.isArray(parsed.ipsrv)) {
-                            if (Array.isArray(parsed.dvbs)) {
-                                for (var d = 0; d < parsed.dvbs.length; d++) {
-                                    var dn = parseInt(parsed.dvbs[d], 10);
-                                    if (dn > 0 && !isNaN(dn)) dvbsChannels.push(dn);
-                                }
-                            }
-                            if (Array.isArray(parsed.ipsrv)) {
-                                for (var ip = 0; ip < parsed.ipsrv.length; ip++) {
-                                    var ipn = parseInt(parsed.ipsrv[ip], 10);
-                                    if (ipn > 0 && !isNaN(ipn)) ipsrvChannels.push(ipn);
-                                }
-                            }
+                        if (Array.isArray(parsed.dvbsSrvIds) || Array.isArray(parsed.ipsrvSrvIds)) {
+                            dvbsSrvIds = parseSrvIdList(parsed.dvbsSrvIds);
+                            ipsrvSrvIds = parseSrvIdList(parsed.ipsrvSrvIds);
                         } else {
-                            var legacyList = [];
-                            if (Array.isArray(parsed.channels)) {
-                                for (var ci = 0; ci < parsed.channels.length; ci++) {
-                                    var cNum = parseInt(parsed.channels[ci], 10);
-                                    if (cNum > 0 && !isNaN(cNum)) legacyList.push(cNum);
-                                }
-                            } else if (parsed.channel) {
-                                var sNum = parseInt(parsed.channel, 10);
-                                if (sNum > 0 && !isNaN(sNum)) legacyList.push(sNum);
+                            var singleList = [];
+                            if (Array.isArray(parsed.srvIds)) {
+                                singleList = parseSrvIdList(parsed.srvIds);
+                            } else if (parsed.srvId != null) {
+                                singleList = parseSrvIdList([parsed.srvId]);
                             }
                             if (parsed.type === 'ipsrv') {
-                                ipsrvChannels = legacyList;
+                                ipsrvSrvIds = singleList;
                             } else {
-                                dvbsChannels = legacyList;
+                                dvbsSrvIds = singleList;
                             }
                         }
 
-                        var totalChannels = dvbsChannels.length + ipsrvChannels.length;
-                        if (!editAction || (editAction !== 'move' && totalChannels === 0)) {
+                        var totalChannels = dvbsSrvIds.length + ipsrvSrvIds.length;
+                        if (!editAction || totalChannels === 0) {
                             release();
-                            res.writeHead(400, { 'content-type': 'application/json' });
-                            res.end(JSON.stringify({ ok: false, error: 'missing action or channels' }));
+                            sendJson(res, 400, { ok: false, error: 'missing action or valid srvIds' });
                             return;
                         }
 
-                        // ACTION 1: DELETE with 1-X gap closure
+                        var dvbsPath = path.join(dataDir, 'dvbs');
+                        var ipsrvPath = path.join(dataDir, 'ipsrv');
+
+                        // ACTION 1: DELETE (pure deletion by default; optional category-scoped gap closure on dvbs;
+                        // uses single ATTACH transaction when deleting from both dvbs and ipsrv)
                         if (editAction === 'delete') {
-                            var delTasks = [];
+                            var compactRequested = !!parsed.compact;
+                            var dvbsDelSet = createDict();
+                            for (var di = 0; di < dvbsSrvIds.length; di++) dvbsDelSet[dvbsSrvIds[di]] = true;
+                            var ipsrvDelSet = createDict();
+                            for (var ipi = 0; ipi < ipsrvSrvIds.length; ipi++) ipsrvDelSet[ipsrvSrvIds[ipi]] = true;
 
-                            if (dvbsChannels.length > 0) {
-                                var dvbsDelSet = {};
-                                for (var di = 0; di < dvbsChannels.length; di++) {
-                                    dvbsDelSet[dvbsChannels[di]] = true;
-                                }
-                                if (parsed.srvId && parsed.type !== 'ipsrv') {
-                                    dvbsDelSet[String(parsed.srvId).trim()] = true;
-                                }
-                                delTasks.push(function () {
-                                    return deleteAndCompactDb(ctx, '/mnt/systemrw/tvs-chms/data/dvbs', dvbsDelSet);
+                            var pDvbs = dvbsSrvIds.length > 0 ? queryChannelsForEdit(ctx, dvbsPath, 1) : Promise.resolve([]);
+                            var pIpsrv = ipsrvSrvIds.length > 0 ? queryChannelsForEdit(ctx, ipsrvPath, -1) : Promise.resolve([]);
+
+                            Promise.all([pDvbs, pIpsrv]).then(function (results) {
+                                var dvbsPlan = planDeleteAndCompact(results[0], dvbsDelSet, {
+                                    allowCompact: true,
+                                    compact: compactRequested
                                 });
-                            }
-
-                            if (ipsrvChannels.length > 0) {
-                                var ipsrvDelSet = {};
-                                for (var ipi = 0; ipi < ipsrvChannels.length; ipi++) {
-                                    ipsrvDelSet[ipsrvChannels[ipi]] = true;
-                                }
-                                if (parsed.srvId && parsed.type === 'ipsrv') {
-                                    ipsrvDelSet[String(parsed.srvId).trim()] = true;
-                                }
-                                delTasks.push(function () {
-                                    return deleteAndCompactDb(ctx, '/mnt/systemrw/tvs-chms/data/ipsrv', ipsrvDelSet);
+                                // Never compact Samsung TV Plus (ipsrv) numbers (they live in 4000+ range).
+                                var ipPlan = planDeleteAndCompact(results[1], ipsrvDelSet, {
+                                    allowCompact: false,
+                                    compact: false
                                 });
-                            }
 
-                            var totalDeleted = 0;
-                            var totalShifted = 0;
-                            var runDelIndex = function (idx) {
-                                if (idx >= delTasks.length) {
+                                var totalDeleted = dvbsPlan.toDelete.length + ipPlan.toDelete.length;
+                                var totalShifted = dvbsPlan.changes.length;
+                                if (totalDeleted === 0) {
+                                    release();
+                                    sendJson(res, 200, {
+                                        ok: true,
+                                        action: 'delete',
+                                        deleted: 0,
+                                        shifted: 0,
+                                        pendingReload: pendingReload
+                                    });
+                                    return;
+                                }
+
+                                function appendPlanSql(parts, tableRef, planObj) {
+                                    var delIds = [];
+                                    for (var x = 0; x < planObj.toDelete.length; x++) delIds.push(planObj.toDelete[x].srvId);
+                                    parts.push('UPDATE ' + tableRef + ' SET elim = 1, hidden = 1, hideGuide = 1, numSel = 0, major = 0 WHERE srvId IN (' + delIds.join(',') + ') AND elim = 0;');
+                                    if (planObj.changes.length > 0) {
+                                        var cases = [];
+                                        var chgIds = [];
+                                        for (var y = 0; y < planObj.changes.length; y++) {
+                                            cases.push('WHEN ' + planObj.changes[y].srvId + ' THEN ' + planObj.changes[y].newMajor);
+                                            chgIds.push(planObj.changes[y].srvId);
+                                        }
+                                        parts.push('UPDATE ' + tableRef + ' SET major = CASE srvId ' + cases.join(' ') + ' END, modifiedByUser = 1 WHERE srvId IN (' + chgIds.join(',') + ') AND elim = 0;');
+                                    }
+                                }
+
+                                var sqlParts = [
+                                    '.bail on',
+                                    '.timeout 5000',
+                                    'PRAGMA busy_timeout = 5000;'
+                                ];
+                                var targetExecDb;
+                                var both = dvbsPlan.toDelete.length > 0 && ipPlan.toDelete.length > 0;
+                                if (both) {
+                                    targetExecDb = dvbsPath;
+                                    sqlParts.push("ATTACH '" + sqlPath(ipsrvPath) + "' AS ipsrv_db;");
+                                    sqlParts.push('BEGIN IMMEDIATE;');
+                                    appendPlanSql(sqlParts, 'main.SRV', dvbsPlan);
+                                    appendPlanSql(sqlParts, 'ipsrv_db.SRV', ipPlan);
+                                    sqlParts.push('COMMIT;');
+                                    sqlParts.push('PRAGMA main.wal_checkpoint(TRUNCATE);');
+                                    sqlParts.push('PRAGMA ipsrv_db.wal_checkpoint(TRUNCATE);');
+                                } else if (dvbsPlan.toDelete.length > 0) {
+                                    targetExecDb = dvbsPath;
+                                    sqlParts.push('BEGIN IMMEDIATE;');
+                                    appendPlanSql(sqlParts, 'SRV', dvbsPlan);
+                                    sqlParts.push('COMMIT;');
+                                    sqlParts.push('PRAGMA wal_checkpoint(TRUNCATE);');
+                                } else {
+                                    targetExecDb = ipsrvPath;
+                                    sqlParts.push('BEGIN IMMEDIATE;');
+                                    appendPlanSql(sqlParts, 'SRV', ipPlan);
+                                    sqlParts.push('COMMIT;');
+                                    sqlParts.push('PRAGMA wal_checkpoint(TRUNCATE);');
+                                }
+
+                                return runSqlFile(ctx, tmpRoot, targetExecDb, sqlParts, 'ch_del_', 15000).then(function () {
                                     release();
                                     cachedChannels = null;
-                                    res.writeHead(200, { 'content-type': 'application/json' });
-                                    res.end(JSON.stringify({
+                                    pendingReload = true;
+                                    sendJson(res, 200, {
                                         ok: true,
                                         action: 'delete',
                                         deleted: totalDeleted,
-                                        shifted: totalShifted
-                                    }));
-                                    return;
-                                }
-                                delTasks[idx]().then(function (result) {
-                                    totalDeleted += (result.deleted || 0);
-                                    totalShifted += (result.shifted || 0);
-                                    runDelIndex(idx + 1);
-                                }, function (delErr) {
-                                    release();
-                                    res.writeHead(500, { 'content-type': 'application/json' });
-                                    res.end(JSON.stringify({ ok: false, error: delErr.message }));
+                                        shifted: totalShifted,
+                                        pendingReload: pendingReload
+                                    });
                                 });
-                            };
-
-                            runDelIndex(0);
+                            }).then(null, function (delErr) {
+                                release();
+                                sendJson(res, 500, { ok: false, error: delErr.message });
+                            });
                             return;
                         }
 
-                        // ACTION 2: MOVE channel(s) with conservation displacement
+                        // ACTION 2: MOVE channel(s) strictly by srvId with slot-conserving displacement
                         if (editAction === 'move') {
-                            var targetType = parsed.type === 'ipsrv' ? 'ipsrv' : 'dvbs';
-                            var dbPath = targetType === 'ipsrv' ? '/mnt/systemrw/tvs-chms/data/ipsrv' : '/mnt/systemrw/tvs-chms/data/dvbs';
-                            var channels = targetType === 'ipsrv' ? ipsrvChannels : dvbsChannels;
+                            if (dvbsSrvIds.length > 0 && ipsrvSrvIds.length > 0) {
+                                release();
+                                sendJson(res, 400, { ok: false, error: 'cannot move Satellite and TV Plus channels together' });
+                                return;
+                            }
+                            var targetType = (parsed.type === 'ipsrv' || ipsrvSrvIds.length > 0) ? 'ipsrv' : 'dvbs';
+                            var moveDbPath = targetType === 'ipsrv' ? ipsrvPath : dvbsPath;
+                            var moveSrvIds = targetType === 'ipsrv' ? ipsrvSrvIds : dvbsSrvIds;
+                            var defaultCatType = targetType === 'ipsrv' ? -1 : 1;
                             var target = parseInt(parsed.target, 10);
                             if (isNaN(target) || target < 1 || target > 9999) {
                                 release();
-                                res.writeHead(400, { 'content-type': 'application/json' });
-                                res.end(JSON.stringify({ ok: false, error: 'target channel must be between 1 and 9999' }));
+                                sendJson(res, 400, { ok: false, error: 'target channel must be between 1 and 9999' });
                                 return;
                             }
 
-                            ctx.execute('sqlite3 ' + dbPath + ' "SELECT srvId, major FROM SRV WHERE elim = 0 ORDER BY major ASC;"', 10000)
-                                .then(function (qRes) {
-                                    if (qRes.exit_code !== 0) {
-                                        release();
-                                        res.writeHead(500, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({ ok: false, error: 'database query failed: ' + (qRes.stderr || 'code ' + qRes.exit_code) }));
-                                        return;
-                                    }
-
-                                    var lines = (qRes.stdout || '').split('\n');
-                                    var dbChannels = [];
-                                    for (var i = 0; i < lines.length; i++) {
-                                        var line = lines[i].trim();
-                                        if (!line) continue;
-                                        var parts = line.split('|');
-                                        if (parts.length >= 2) {
-                                            var m = parseInt(parts[1], 10);
-                                            if (!isNaN(m) && m > 0) {
-                                                dbChannels.push({
-                                                    srvId: parts[0],
-                                                    major: m
-                                                });
-                                            }
-                                        }
-                                    }
-
-                                    var plan = computeChannelMoves(dbChannels, channels, target);
+                            queryChannelsForEdit(ctx, moveDbPath, defaultCatType)
+                                .then(function (dbChannels) {
+                                    var plan = computeChannelMoves(dbChannels, moveSrvIds, target, targetType === 'dvbs');
                                     if (plan.error) {
                                         release();
-                                        res.writeHead(400, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({ ok: false, error: plan.error }));
+                                        sendJson(res, 400, { ok: false, error: plan.error });
                                         return;
                                     }
 
                                     var changes = plan.changes || [];
                                     if (changes.length === 0) {
                                         release();
-                                        res.writeHead(200, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({ ok: true, action: 'move', changed: 0, message: 'Channels are already at the target location' }));
+                                        sendJson(res, 200, { ok: true, action: 'move', changed: 0, message: 'Channels are already at the target location', pendingReload: pendingReload });
                                         return;
                                     }
 
@@ -926,102 +1004,84 @@ module.exports = function (ctx) {
                                         srvIdList.push(changes[c].srvId);
                                     }
 
-                                    var moveSql = '.bail on\n' +
-                                        '.timeout 5000\n' +
-                                        'PRAGMA busy_timeout = 5000;\n' +
-                                        'BEGIN TRANSACTION;\n' +
-                                        'UPDATE SRV SET major = CASE srvId ' + caseParts.join(' ') + ' END, modifiedByUser = 1 WHERE srvId IN (' + srvIdList.join(',') + ');\n' +
-                                        'COMMIT;\n' +
-                                        'PRAGMA wal_checkpoint(TRUNCATE);';
+                                    var moveParts = [
+                                        '.bail on',
+                                        '.timeout 5000',
+                                        'PRAGMA busy_timeout = 5000;',
+                                        'BEGIN IMMEDIATE;',
+                                        'UPDATE SRV SET major = CASE srvId ' + caseParts.join(' ') + ' END, modifiedByUser = 1 WHERE srvId IN (' + srvIdList.join(',') + ') AND elim = 0;',
+                                        'COMMIT;',
+                                        'PRAGMA wal_checkpoint(TRUNCATE);'
+                                    ];
 
-                                    var tmpMove = '/tmp/ch_mv_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6) + '.sql';
-                                    try {
-                                        fs.writeFileSync(tmpMove, moveSql, 'utf8');
-                                    } catch (fsErr) {
-                                        release();
-                                        res.writeHead(500, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({ ok: false, error: 'Failed to write SQL: ' + fsErr.message }));
-                                        return;
-                                    }
-
-                                    var cmd = 'sqlite3 ' + dbPath + ' < ' + tmpMove + '; rm -f ' + tmpMove + ';';
-                                    ctx.execute(cmd, 15000).then(function (upRes) {
+                                    return runSqlFile(ctx, tmpRoot, moveDbPath, moveParts, 'ch_mv_', 15000).then(function () {
                                         release();
                                         cachedChannels = null;
-                                        res.writeHead(200, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({
-                                            ok: upRes.exit_code === 0,
+                                        pendingReload = true;
+                                        sendJson(res, 200, {
+                                            ok: true,
                                             action: 'move',
                                             target: target,
-                                            moved: channels.length,
+                                            moved: moveSrvIds.length,
                                             changed: changes.length,
                                             changes: changes,
-                                            stderr: upRes.stderr
-                                        }));
-                                    }, function (upErr) {
-                                        try { fs.unlinkSync(tmpMove); } catch (e) {}
-                                        release();
-                                        res.writeHead(500, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({ ok: false, error: upErr.message }));
+                                            pendingReload: pendingReload
+                                        });
                                     });
-                                }, function (qErr) {
+                                })
+                                .then(null, function (mvErr) {
                                     release();
-                                    res.writeHead(500, { 'content-type': 'application/json' });
-                                    res.end(JSON.stringify({ ok: false, error: qErr.message }));
+                                    sendJson(res, 500, { ok: false, error: mvErr.message });
                                 });
                             return;
                         }
 
-                        // ACTION 3: HIDE, UNHIDE
+                        // ACTION 3: HIDE / UNHIDE strictly by srvId (atomic ATTACH when spanning both DBs)
                         if (editAction === 'hide' || editAction === 'unhide') {
                             var hideVal = editAction === 'hide' ? 1 : 0;
                             var numSelVal = editAction === 'hide' ? 0 : 1;
-                            var updateTasks = [];
-
-                            if (dvbsChannels.length > 0) {
-                                var sqlDvbs = 'UPDATE SRV SET hidden = ' + hideVal + ', hideGuide = ' + hideVal + ', numSel = ' + numSelVal + ' WHERE major IN (' + dvbsChannels.join(',') + ');';
-                                var cmdDvbs = 'sqlite3 /mnt/systemrw/tvs-chms/data/dvbs "PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE; ' + sqlDvbs + ' COMMIT; PRAGMA wal_checkpoint(TRUNCATE);"';
-                                updateTasks.push(function () { return ctx.execute(cmdDvbs, 10000); });
+                            var visParts = [
+                                '.bail on',
+                                '.timeout 5000',
+                                'PRAGMA busy_timeout = 5000;'
+                            ];
+                            var visDb;
+                            if (dvbsSrvIds.length > 0 && ipsrvSrvIds.length > 0) {
+                                visDb = dvbsPath;
+                                visParts.push("ATTACH '" + sqlPath(ipsrvPath) + "' AS ipsrv_db;");
+                                visParts.push('BEGIN IMMEDIATE;');
+                                visParts.push('UPDATE main.SRV SET hidden = ' + hideVal + ', hideGuide = ' + hideVal + ', numSel = ' + numSelVal + ' WHERE srvId IN (' + dvbsSrvIds.join(',') + ') AND elim = 0;');
+                                visParts.push('UPDATE ipsrv_db.SRV SET hidden = ' + hideVal + ', hideGuide = ' + hideVal + ', numSel = ' + numSelVal + ' WHERE srvId IN (' + ipsrvSrvIds.join(',') + ') AND elim = 0;');
+                                visParts.push('COMMIT;');
+                                visParts.push('PRAGMA main.wal_checkpoint(TRUNCATE);');
+                                visParts.push('PRAGMA ipsrv_db.wal_checkpoint(TRUNCATE);');
+                            } else {
+                                visDb = dvbsSrvIds.length > 0 ? dvbsPath : ipsrvPath;
+                                var visIds = dvbsSrvIds.length > 0 ? dvbsSrvIds : ipsrvSrvIds;
+                                visParts.push('BEGIN IMMEDIATE;');
+                                visParts.push('UPDATE SRV SET hidden = ' + hideVal + ', hideGuide = ' + hideVal + ', numSel = ' + numSelVal + ' WHERE srvId IN (' + visIds.join(',') + ') AND elim = 0;');
+                                visParts.push('COMMIT;');
+                                visParts.push('PRAGMA wal_checkpoint(TRUNCATE);');
                             }
 
-                            if (ipsrvChannels.length > 0) {
-                                var sqlIp = 'UPDATE SRV SET hidden = ' + hideVal + ', hideGuide = ' + hideVal + ', numSel = ' + numSelVal + ' WHERE major IN (' + ipsrvChannels.join(',') + ');';
-                                var cmdIp = 'sqlite3 /mnt/systemrw/tvs-chms/data/ipsrv "PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE; ' + sqlIp + ' COMMIT; PRAGMA wal_checkpoint(TRUNCATE);"';
-                                updateTasks.push(function () { return ctx.execute(cmdIp, 10000); });
-                            }
-
-                            var runUpdateIndex = function (uIdx) {
-                                if (uIdx >= updateTasks.length) {
-                                    release();
-                                    cachedChannels = null;
-                                    res.writeHead(200, { 'content-type': 'application/json' });
-                                    res.end(JSON.stringify({
-                                        ok: true,
-                                        action: editAction,
-                                        count: totalChannels
-                                    }));
-                                    return;
-                                }
-                                updateTasks[uIdx]().then(function (r) {
-                                    if (r.exit_code !== 0) {
-                                        release();
-                                        res.writeHead(500, { 'content-type': 'application/json' });
-                                        res.end(JSON.stringify({ ok: false, error: r.stderr || 'sqlite error code ' + r.exit_code }));
-                                        return;
-                                    }
-                                    runUpdateIndex(uIdx + 1);
-                                }, function (uErr) {
-                                    release();
-                                    res.writeHead(500, { 'content-type': 'application/json' });
-                                    res.end(JSON.stringify({ ok: false, error: uErr.message }));
+                            runSqlFile(ctx, tmpRoot, visDb, visParts, 'ch_vis_', 12000).then(function () {
+                                release();
+                                cachedChannels = null;
+                                pendingReload = true;
+                                sendJson(res, 200, {
+                                    ok: true,
+                                    action: editAction,
+                                    count: totalChannels,
+                                    pendingReload: pendingReload
                                 });
-                            };
-
-                            runUpdateIndex(0);
+                            }, function (uErr) {
+                                release();
+                                sendJson(res, 500, { ok: false, error: uErr.message });
+                            });
                             return;
                         }
 
-                        // ACTION 4: RENAME
+                        // ACTION 4: RENAME strictly by srvId (no major fallback)
                         if (editAction === 'rename') {
                             var newName = (parsed.name || '').trim();
                             if (!newName) {
@@ -1034,37 +1094,38 @@ module.exports = function (ctx) {
                                 sendJson(res, 400, { ok: false, error: 'channel name must be 1-' + MAX_CHANNEL_NAME_LEN + ' printable characters' });
                                 return;
                             }
-                            var hexName = encodeUtf16Hex(newName);
-                            var srvIdStr = parsed.srvId != null ? String(parsed.srvId).trim() : '';
-                            var renameDbPath = (parsed.type === 'ipsrv' || ipsrvChannels.length > 0) ?
-                                path.join(dataDir, 'ipsrv') :
-                                path.join(dataDir, 'dvbs');
-                            var renameChs = (parsed.type === 'ipsrv' || ipsrvChannels.length > 0) ? ipsrvChannels : dvbsChannels;
+                            var renameTargetType = (parsed.type === 'ipsrv' || ipsrvSrvIds.length > 0) ? 'ipsrv' : 'dvbs';
+                            var renameDbPath = renameTargetType === 'ipsrv' ? ipsrvPath : dvbsPath;
+                            var srvIdStr = renameTargetType === 'ipsrv'
+                                ? (ipsrvSrvIds.length > 0 ? ipsrvSrvIds[0] : '')
+                                : (dvbsSrvIds.length > 0 ? dvbsSrvIds[0] : '');
 
-                            var renameSql = '';
-                            if (srvIdStr && SRVID_RE.test(srvIdStr)) {
-                                renameSql = "UPDATE SRV SET srvName = CAST(X'" + hexName + "' AS TEXT), modifiedByUser = 1 WHERE srvId = " + srvIdStr + ";";
-                            } else if (renameChs.length > 0) {
-                                renameSql = "UPDATE SRV SET srvName = CAST(X'" + hexName + "' AS TEXT), modifiedByUser = 1 WHERE major = " + renameChs[0] + " AND elim = 0;";
-                            } else {
+                            if (!srvIdStr || !SRVID_RE.test(srvIdStr)) {
                                 release();
-                                sendJson(res, 400, { ok: false, error: 'missing channel major or srvId' });
+                                sendJson(res, 400, { ok: false, error: 'missing valid channel srvId' });
                                 return;
                             }
 
-                            var renameCmd = 'sqlite3 -bail ' + shQuote(renameDbPath) + ' "PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE; ' + renameSql + ' COMMIT; PRAGMA wal_checkpoint(TRUNCATE);"';
-                            ctx.execute(renameCmd, 10000).then(function (r) {
+                            var hexName = encodeUtf16Hex(newName);
+                            var renameParts = [
+                                '.bail on',
+                                '.timeout 5000',
+                                'PRAGMA busy_timeout = 5000;',
+                                'BEGIN IMMEDIATE;',
+                                "UPDATE SRV SET srvName = CAST(X'" + hexName + "' AS TEXT), modifiedByUser = 1 WHERE srvId = " + srvIdStr + ' AND elim = 0;',
+                                'COMMIT;',
+                                'PRAGMA wal_checkpoint(TRUNCATE);'
+                            ];
+                            runSqlFile(ctx, tmpRoot, renameDbPath, renameParts, 'ch_ren_', 10000).then(function () {
                                 release();
                                 cachedChannels = null;
-                                if (r.exit_code !== 0) {
-                                    sendJson(res, 500, { ok: false, error: r.stderr || ('sqlite error code ' + r.exit_code) });
-                                    return;
-                                }
+                                pendingReload = true;
                                 sendJson(res, 200, {
                                     ok: true,
                                     action: 'rename',
+                                    srvId: srvIdStr,
                                     count: 1,
-                                    stderr: r.stderr
+                                    pendingReload: pendingReload
                                 });
                             }, function (e) {
                                 release();

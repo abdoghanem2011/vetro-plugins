@@ -767,6 +767,61 @@
     background: rgba(255, 255, 255, 0.1);
     border-color: var(--text-dim);
   }
+  .btn-restore.pending-highlight,
+  .btn-ctrl-action.reload.pending-highlight {
+    background: rgba(245, 158, 11, 0.22);
+    border-color: var(--amber);
+    color: #fbbf24;
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.18);
+  }
+
+  .pending-reload-banner {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: var(--radius-s);
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    color: #fcd34d;
+    font-size: 12.5px;
+    line-height: 1.4;
+  }
+  .app-container.editor-mode.has-pending-reload .pending-reload-banner {
+    display: flex;
+  }
+
+  .meta-tag.radio {
+    color: #f472b6;
+    background: rgba(244, 114, 182, 0.12);
+  }
+  .meta-tag.data {
+    color: #94a3b8;
+    background: rgba(148, 163, 184, 0.12);
+  }
+
+  .modal-checkbox-row {
+    display: none;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 9px 10px;
+    border-radius: var(--radius-s);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    font-size: 12.5px;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.4;
+  }
+  .modal-checkbox-row input {
+    margin-top: 2px;
+    flex-shrink: 0;
+    accent-color: var(--accent);
+  }
 
   /* Floating Toast */
   .toast {
@@ -1081,6 +1136,9 @@
         <input type="file" id="file-import-input" accept=".zip,application/zip" style="display:none;">
       </div>
     </div>
+    <div class="pending-reload-banner" id="pending-reload-banner">
+      <span>⚠️ Edits are saved to SQLite on disk, but the live TV tuner won't reflect them (and TV remote or background updates may overwrite them) until you click <strong>🔄 Reload TV</strong>.</span>
+    </div>
   </div>
 
   <!-- Sticky Controls Panel -->
@@ -1146,6 +1204,10 @@
       <div class="modal-body">
         <h3 class="modal-title" id="modal-title">Confirm Action</h3>
         <p class="modal-text" id="modal-msg">Are you sure?</p>
+        <label class="modal-checkbox-row" id="modal-checkbox-wrap" for="modal-checkbox" style="display:none;">
+          <input type="checkbox" id="modal-checkbox">
+          <span id="modal-checkbox-label"></span>
+        </label>
       </div>
     </div>
     <div class="modal-actions">
@@ -1271,10 +1333,31 @@
   var confirmModal = document.getElementById('confirm-modal');
   var modalTitle = document.getElementById('modal-title');
   var modalMsg = document.getElementById('modal-msg');
+  var modalCheckboxWrap = document.getElementById('modal-checkbox-wrap');
+  var modalCheckbox = document.getElementById('modal-checkbox');
+  var modalCheckboxLabel = document.getElementById('modal-checkbox-label');
   var modalIcon = document.getElementById('modal-icon');
   var modalBtnCancel = document.getElementById('modal-btn-cancel');
   var modalBtnConfirm = document.getElementById('modal-btn-confirm');
   var pendingConfirmCallback = null;
+
+  var btnReloadTv = document.getElementById('btn-reload-tv');
+  var btnStickyReload = document.getElementById('btn-sticky-reload');
+  var editorBar = document.getElementById('editor-bar');
+  var pendingReloadState = false;
+
+  function setPendingReload(flag) {
+    pendingReloadState = !!flag;
+    if (appEl) {
+      appEl.classList.toggle('has-pending-reload', pendingReloadState);
+    }
+    if (btnReloadTv) {
+      btnReloadTv.classList.toggle('pending-highlight', pendingReloadState);
+    }
+    if (btnStickyReload) {
+      btnStickyReload.classList.toggle('pending-highlight', pendingReloadState);
+    }
+  }
 
   function showConfirmModal(opts, onConfirm) {
     modalTitle.textContent = opts.title || 'Confirm Action';
@@ -1284,6 +1367,18 @@
     modalIcon.textContent = opts.icon || (isDanger ? '🗑️' : '⚠️');
     modalIcon.className = 'modal-icon' + (isDanger ? '' : ' warning');
     modalBtnConfirm.className = 'btn-modal-confirm' + (isDanger ? '' : ' warning');
+
+    if (modalCheckboxWrap && modalCheckbox && modalCheckboxLabel) {
+      if (opts.checkboxLabel) {
+        modalCheckboxLabel.textContent = opts.checkboxLabel;
+        modalCheckbox.checked = !!opts.checkboxChecked;
+        modalCheckboxWrap.style.display = 'flex';
+      } else {
+        modalCheckbox.checked = false;
+        modalCheckboxWrap.style.display = 'none';
+      }
+    }
+
     pendingConfirmCallback = onConfirm;
     confirmModal.style.display = 'flex';
   }
@@ -1291,14 +1386,19 @@
   function hideConfirmModal() {
     confirmModal.style.display = 'none';
     pendingConfirmCallback = null;
+    if (modalCheckboxWrap && modalCheckbox) {
+      modalCheckbox.checked = false;
+      modalCheckboxWrap.style.display = 'none';
+    }
   }
 
   if (modalBtnCancel) modalBtnCancel.addEventListener('click', hideConfirmModal);
   if (modalBtnConfirm) {
     modalBtnConfirm.addEventListener('click', function () {
       var cb = pendingConfirmCallback;
+      var cbState = { checked: !!(modalCheckbox && modalCheckbox.checked) };
       hideConfirmModal();
-      if (cb) cb();
+      if (cb) cb(cbState);
     });
   }
   // Dismiss modal only if mousedown AND click both occurred directly on backdrop
@@ -1333,6 +1433,23 @@
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  function getChannelDbType(ch) {
+    return (ch && ch.type === 'iptv') ? 'ipsrv' : 'dvbs';
+  }
+
+  function getChannelKey(ch) {
+    if (!ch || !ch.srvId) return '';
+    return getChannelDbType(ch) + ':' + String(ch.srvId);
+  }
+
+  function findChannelByKey(chKey) {
+    if (!chKey) return null;
+    for (var i = 0; i < allChannels.length; i++) {
+      if (getChannelKey(allChannels[i]) === chKey) return allChannels[i];
+    }
+    return null;
+  }
+
   function fetchChannels(refresh) {
     var url = 'list' + (refresh ? '?refresh=1' : '');
     fetch(url)
@@ -1344,6 +1461,8 @@
         }
 
         allChannels = data.channels || [];
+        setPendingReload(!!data.pendingReload);
+
         var satCount = 0;
         var ipCount = 0;
         var hiddenCount = 0;
@@ -1368,7 +1487,7 @@
   var currentSort = 'default'; // 'default', 'num-desc', 'name-asc', 'name-desc'
   var sortSelect = document.getElementById('sort-select');
 
-  var selectedChannels = {}; // map: { chNum: true }
+  var selectedChannels = {}; // map: { "dvbs:<srvId>" | "ipsrv:<srvId>": true }
   var chkSelectAll = document.getElementById('chk-select-all');
   var labelSelectAll = document.getElementById('label-select-all');
   var btnBatchHide = document.getElementById('btn-batch-hide');
@@ -1394,20 +1513,20 @@
     return list.slice().sort(function (a, b) { return a.num - b.num; });
   }
 
-  function getSelectedArray() {
-    var arr = [];
-    for (var k in selectedChannels) {
-      if (selectedChannels.hasOwnProperty(k) && selectedChannels[k]) {
-        var n = parseInt(k, 10);
-        if (!isNaN(n) && n > 0) arr.push(n);
+  function getSelectedChannelsList() {
+    var list = [];
+    for (var i = 0; i < allChannels.length; i++) {
+      var k = getChannelKey(allChannels[i]);
+      if (k && selectedChannels[k]) {
+        list.push(allChannels[i]);
       }
     }
-    return arr;
+    return list;
   }
 
   function updateBatchToolbar() {
-    var arr = getSelectedArray();
-    var count = arr.length;
+    var selList = getSelectedChannelsList();
+    var count = selList.length;
     if (batchCounter) {
       if (count > 0) {
         batchCounter.textContent = count;
@@ -1426,7 +1545,8 @@
 
     var allVisSelected = filteredChannels.length > 0;
     for (var i = 0; i < filteredChannels.length; i++) {
-      if (!selectedChannels[filteredChannels[i].num]) {
+      var k = getChannelKey(filteredChannels[i]);
+      if (!k || !selectedChannels[k]) {
         allVisSelected = false;
         break;
       }
@@ -1438,15 +1558,16 @@
     if (labelSelectAll) labelSelectAll.textContent = 'All';
   }
 
-  function toggleChannelSelection(chNum) {
-    if (selectedChannels[chNum]) {
-      delete selectedChannels[chNum];
+  function toggleChannelSelection(chKey) {
+    if (!chKey) return;
+    if (selectedChannels[chKey]) {
+      delete selectedChannels[chKey];
     } else {
-      selectedChannels[chNum] = true;
+      selectedChannels[chKey] = true;
     }
-    var card = listEl.querySelector('.channel-card[data-ch="' + chNum + '"]');
+    var card = listEl.querySelector('.channel-card[data-key="' + chKey + '"]');
     if (card) {
-      var isSel = !!selectedChannels[chNum];
+      var isSel = !!selectedChannels[chKey];
       card.classList.toggle('selected', isSel);
       var chk = card.querySelector('.card-chk');
       if (chk) chk.checked = isSel;
@@ -1455,9 +1576,10 @@
   }
 
   function toggleSelectAll() {
-    var allVisSelected = true;
+    var allVisSelected = filteredChannels.length > 0;
     for (var i = 0; i < filteredChannels.length; i++) {
-      if (!selectedChannels[filteredChannels[i].num]) {
+      var fk = getChannelKey(filteredChannels[i]);
+      if (!fk || !selectedChannels[fk]) {
         allVisSelected = false;
         break;
       }
@@ -1465,18 +1587,20 @@
 
     if (allVisSelected) {
       for (var j = 0; j < filteredChannels.length; j++) {
-        delete selectedChannels[filteredChannels[j].num];
+        var dk = getChannelKey(filteredChannels[j]);
+        if (dk) delete selectedChannels[dk];
       }
     } else {
       for (var k = 0; k < filteredChannels.length; k++) {
-        selectedChannels[filteredChannels[k].num] = true;
+        var ak = getChannelKey(filteredChannels[k]);
+        if (ak) selectedChannels[ak] = true;
       }
     }
 
     var cards = listEl.querySelectorAll('.channel-card');
     for (var c = 0; c < cards.length; c++) {
-      var cNum = parseInt(cards[c].getAttribute('data-ch'), 10);
-      var isSel = !!selectedChannels[cNum];
+      var cKey = cards[c].getAttribute('data-key') || '';
+      var isSel = !!(cKey && selectedChannels[cKey]);
       cards[c].classList.toggle('selected', isSel);
       var chk = cards[c].querySelector('.card-chk');
       if (chk) chk.checked = isSel;
@@ -1498,48 +1622,55 @@
   if (chkSelectAll) chkSelectAll.addEventListener('change', toggleSelectAll);
 
   function doBatchEdit(action) {
-    var chNums = getSelectedArray();
-    if (chNums.length === 0) {
+    var selList = getSelectedChannelsList();
+    if (selList.length === 0) {
       showToast('⚠️ No channels selected', 2000);
       return;
     }
 
     if (action === 'delete') {
-      var isSingle = chNums.length === 1;
+      var hasDvbs = false;
+      var hasIptv = false;
+      for (var si = 0; si < selList.length; si++) {
+        if (selList[si].type === 'iptv') hasIptv = true;
+        else hasDvbs = true;
+      }
+      var isSingle = selList.length === 1;
+      var msgText = 'Delete ' + selList.length + ' selected channel' + (isSingle ? '' : 's') + ' from the TV database?';
+      if (!hasDvbs && hasIptv) {
+        msgText += ' Samsung TV Plus channel numbers will not be changed.';
+      }
       showConfirmModal({
-        title: 'Delete ' + chNums.length + (isSingle ? ' Channel?' : ' Channels?'),
-        message: 'Are you sure you want to delete ' + chNums.length + ' selected channel' + (isSingle ? '' : 's') + ' from your TV? Remaining channels will automatically shift to fill gaps (1-X).',
-        confirmText: 'Delete ' + chNums.length + (isSingle ? ' Channel' : ' Channels'),
+        title: 'Delete ' + selList.length + (isSingle ? ' Channel?' : ' Channels?'),
+        message: msgText,
+        confirmText: 'Delete ' + selList.length + (isSingle ? ' Channel' : ' Channels'),
         danger: true,
-        icon: '🗑️'
-      }, function () {
-        sendBatchEditRequest('delete', chNums);
+        icon: '🗑️',
+        checkboxLabel: hasDvbs ? 'Close number gaps after deleting (renumber remaining Satellite channels in the edited category; hidden channels and TV Plus stay untouched)' : '',
+        checkboxChecked: false
+      }, function (res) {
+        sendBatchEditRequest('delete', selList, { compact: !!(res && res.checked) });
       });
       return;
     }
 
-    sendBatchEditRequest(action, chNums);
+    sendBatchEditRequest(action, selList, {});
   }
 
-  function sendBatchEditRequest(action, chNums) {
+  function sendBatchEditRequest(action, selList, opts) {
     var actionLabel = action === 'delete' ? 'deleted' : (action === 'hide' ? 'hidden' : 'unhidden');
-    showToast('⏳ Updating ' + chNums.length + ' channels…', 3500);
+    showToast('⏳ Updating ' + selList.length + ' channel(s)…', 3500);
 
-    var dvbsChannels = [];
-    var ipsrvChannels = [];
-    var selMap = {};
-    for (var s = 0; s < chNums.length; s++) {
-      selMap[chNums[s]] = true;
-    }
+    var dvbsSrvIds = [];
+    var ipsrvSrvIds = [];
 
-    for (var i = 0; i < allChannels.length; i++) {
-      var ch = allChannels[i];
-      if (selMap[ch.num]) {
-        if (ch.type === 'iptv') {
-          ipsrvChannels.push(ch.num);
-        } else {
-          dvbsChannels.push(ch.num);
-        }
+    for (var i = 0; i < selList.length; i++) {
+      var ch = selList[i];
+      if (!ch || !ch.srvId) continue;
+      if (ch.type === 'iptv') {
+        ipsrvSrvIds.push(String(ch.srvId));
+      } else {
+        dvbsSrvIds.push(String(ch.srvId));
       }
     }
 
@@ -1548,14 +1679,16 @@
       headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         action: action,
-        dvbs: dvbsChannels,
-        ipsrv: ipsrvChannels
+        dvbsSrvIds: dvbsSrvIds,
+        ipsrvSrvIds: ipsrvSrvIds,
+        compact: !!(opts && opts.compact)
       })
     })
     .then(function (res) { return res.json(); })
     .then(function (data) {
       if (data.ok) {
-        showToast('✅ ' + chNums.length + ' channels ' + actionLabel, 2500);
+        showToast('✅ ' + selList.length + ' channel(s) ' + actionLabel + ' (click Reload TV to apply)', 3000);
+        setPendingReload(data.pendingReload !== false);
         clearAllSelections();
         fetchChannels(true);
       } else {
@@ -1650,7 +1783,8 @@
 
   function renderChannelItem(ch) {
     var isEditor = currentView === 'editor';
-    var isSelected = !!selectedChannels[ch.num];
+    var chKey = getChannelKey(ch);
+    var isSelected = !!(chKey && selectedChannels[chKey]);
 
     var metaHtml = '';
     if (ch.type === 'dvbs') {
@@ -1659,6 +1793,11 @@
       }
       if (ch.sat) {
         metaHtml += '<span class="meta-tag sat">' + escapeHtml(ch.sat) + '</span>';
+      }
+      if (ch.category === 'radio') {
+        metaHtml += '<span class="meta-tag radio">Radio</span>';
+      } else if (ch.category === 'data') {
+        metaHtml += '<span class="meta-tag data">Data</span>';
       }
       if (ch.scrambled) {
         metaHtml += '<span class="meta-tag scrambled">Scrambled</span>';
@@ -1674,14 +1813,14 @@
     var chkHtml = '';
     if (isEditor) {
       chkHtml = '<div class="ch-checkbox-col">' +
-                '<input type="checkbox" class="ch-checkbox card-chk" data-ch="' + ch.num + '"' + (isSelected ? ' checked' : '') + ' tabindex="-1">' +
+                '<input type="checkbox" class="ch-checkbox card-chk" data-key="' + escapeHtml(chKey) + '" data-ch="' + ch.num + '"' + (isSelected ? ' checked' : '') + ' tabindex="-1">' +
                 '</div>';
     }
 
     // Tune button in list / editor views
     var rightAction = '';
     if (!ch.hidden) {
-      rightAction = '<button type="button" class="btn-tune" data-ch="' + ch.num + '" data-name="' + escapeHtml(ch.name) + '" data-srvid="' + (ch.srvId || '') + '"><span>📺</span> Tune</button>';
+      rightAction = '<button type="button" class="btn-tune" data-ch="' + ch.num + '" data-name="' + escapeHtml(ch.name) + '" data-srvid="' + escapeHtml(ch.srvId || '') + '"><span>📺</span> Tune</button>';
     } else if (isEditor) {
       rightAction = '<span class="meta-tag hidden" style="font-size:11px;padding:3px 8px;">🙈 Hidden</span>';
     }
@@ -1689,7 +1828,7 @@
     var nameEditHint = isEditor ? ' <span class="edit-hint" title="Click channel name to rename">✏️</span>' : '';
     var nameTitle = isEditor ? ' title="Click channel name to rename"' : '';
 
-    return '<div class="channel-card' + (ch.hidden ? ' is-hidden' : '') + (isSelected ? ' selected' : '') + '" data-ch="' + ch.num + '" data-name="' + escapeHtml(ch.name) + '" data-srvid="' + (ch.srvId || '') + '">' +
+    return '<div class="channel-card' + (ch.hidden ? ' is-hidden' : '') + (isSelected ? ' selected' : '') + '" data-key="' + escapeHtml(chKey) + '" data-ch="' + ch.num + '" data-type="' + escapeHtml(getChannelDbType(ch)) + '" data-cat="' + escapeHtml(ch.category || 'tv') + '" data-name="' + escapeHtml(ch.name) + '" data-srvid="' + escapeHtml(ch.srvId || '') + '">' +
              chkHtml +
              '<div class="channel-left">' +
                '<div class="channel-num-badge">#' + ch.num + '</div>' +
@@ -1738,15 +1877,16 @@
 
     var card = e.target.closest('.channel-card');
     if (card) {
+      var key = card.getAttribute('data-key') || '';
       var num = parseInt(card.getAttribute('data-ch'), 10);
       var name = card.getAttribute('data-name') || ('Channel ' + num);
       var srvId = card.getAttribute('data-srvid') || '';
       if (currentView === 'editor') {
         if (e.target.closest('.channel-name')) {
-          openRenameModal(num, name, srvId);
+          openRenameModal(key);
           return;
         }
-        toggleChannelSelection(num);
+        toggleChannelSelection(key);
       } else {
         var isHidden = card.classList.contains('is-hidden');
         if (!isHidden) {
@@ -1764,15 +1904,24 @@
   var renameBtnCancel = document.getElementById('rename-btn-cancel');
   var renameBtnSave = document.getElementById('rename-btn-save');
 
-  var currentRenameCh = null;
-  var currentRenameSrvId = null;
+  var currentRenameChannel = null;
 
-  function openRenameModal(chNum, currentName, srvId) {
-    currentRenameCh = chNum;
-    currentRenameSrvId = srvId || '';
-    if (renameTitle) renameTitle.textContent = 'Rename Channel #' + chNum;
-    if (renameSubtitle) renameSubtitle.textContent = 'Current: ' + (currentName || 'Channel ' + chNum);
-    if (renameInput) renameInput.value = currentName || '';
+  function openRenameModal(chKey) {
+    var ch = findChannelByKey(chKey);
+    if (!ch || !ch.srvId) {
+      showToast('⚠️ Channel identifier missing', 2500);
+      return;
+    }
+    currentRenameChannel = {
+      key: chKey,
+      type: getChannelDbType(ch),
+      srvId: String(ch.srvId),
+      num: ch.num,
+      name: ch.name || ('Channel ' + ch.num)
+    };
+    if (renameTitle) renameTitle.textContent = 'Rename Channel #' + ch.num;
+    if (renameSubtitle) renameSubtitle.textContent = 'Current: ' + currentRenameChannel.name;
+    if (renameInput) renameInput.value = ch.name || '';
     if (renameModal) renameModal.style.display = 'flex';
 
     setTimeout(function () {
@@ -1785,12 +1934,11 @@
 
   function closeRenameModal() {
     if (renameModal) renameModal.style.display = 'none';
-    currentRenameCh = null;
-    currentRenameSrvId = null;
+    currentRenameChannel = null;
   }
 
   function doSaveRename() {
-    if (!currentRenameCh) return;
+    if (!currentRenameChannel) return;
     var newName = (renameInput ? renameInput.value : '').trim();
     if (!newName) {
       showToast('⚠️ Please enter a channel name', 2500);
@@ -1798,27 +1946,17 @@
       return;
     }
 
-    var targetNum = currentRenameCh;
-    var targetSrvId = currentRenameSrvId;
+    var target = currentRenameChannel;
     closeRenameModal();
-    showToast('⏳ Renaming channel #' + targetNum + '…', 3000);
-
-    var targetType = 'dvbs';
-    for (var i = 0; i < allChannels.length; i++) {
-      if (allChannels[i].num === targetNum) {
-        if (allChannels[i].type === 'iptv') targetType = 'ipsrv';
-        break;
-      }
-    }
+    showToast('⏳ Renaming channel #' + target.num + '…', 3000);
 
     fetch('edit', {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         action: 'rename',
-        channels: [targetNum],
-        srvId: targetSrvId || undefined,
-        type: targetType,
+        type: target.type,
+        srvId: target.srvId,
         name: newName
       })
     })
@@ -1826,19 +1964,20 @@
     .then(function (data) {
       if (data.ok) {
         showToast('✅ Renamed to "' + newName + '" (click Reload TV to apply to tuner)', 3500);
+        setPendingReload(data.pendingReload !== false);
         for (var i = 0; i < allChannels.length; i++) {
-          if (allChannels[i].num === targetNum) {
+          if (getChannelKey(allChannels[i]) === target.key) {
             allChannels[i].name = newName;
             break;
           }
         }
         for (var j = 0; j < filteredChannels.length; j++) {
-          if (filteredChannels[j].num === targetNum) {
+          if (getChannelKey(filteredChannels[j]) === target.key) {
             filteredChannels[j].name = newName;
             break;
           }
         }
-        var card = listEl.querySelector('.channel-card[data-ch="' + targetNum + '"]');
+        var card = listEl.querySelector('.channel-card[data-key="' + target.key + '"]');
         if (card) {
           card.setAttribute('data-name', newName);
           var nameEl = card.querySelector('.channel-name');
@@ -1890,40 +2029,33 @@
   var currentMoveSourceType = 'dvbs';
 
   function openMoveModal() {
-    var selNums = getSelectedArray();
-    if (selNums.length === 0) {
+    var selList = getSelectedChannelsList();
+    if (selList.length === 0) {
       showToast('⚠️ Please select at least one channel to move', 2000);
       return;
     }
 
-    var chMap = {};
-    for (var i = 0; i < allChannels.length; i++) {
-      chMap[allChannels[i].num] = allChannels[i];
-    }
-
-    currentMoveChannels = [];
     var typesFound = {};
-    for (var s = 0; s < selNums.length; s++) {
-      var ch = chMap[selNums[s]];
-      if (ch) {
-        currentMoveChannels.push(ch);
-        typesFound[ch.type || 'dvbs'] = true;
-      }
+    var catsFound = {};
+    for (var s = 0; s < selList.length; s++) {
+      var dbType = getChannelDbType(selList[s]);
+      typesFound[dbType] = true;
+      catsFound[selList[s].category || 'tv'] = true;
     }
 
-    currentMoveChannels.sort(function (a, b) { return a.num - b.num; });
-
-    var typesArr = [];
-    for (var tk in typesFound) {
-      if (typesFound.hasOwnProperty(tk)) typesArr.push(tk);
-    }
-
+    var typesArr = Object.keys(typesFound);
     if (typesArr.length > 1) {
-      showToast('⚠️ Selected channels belong to different sources (Satellite and TV Plus). Please select channels from one source to move.', 3500);
+      showToast('⚠️ Selected channels belong to different sources (Satellite and TV Plus). Select channels from one source to move.', 3500);
+      return;
+    }
+
+    if (typesArr[0] === 'dvbs' && Object.keys(catsFound).length > 1) {
+      showToast('⚠️ Selected Satellite channels mix different service types (TV, Radio, or Data). Select one category to move.', 3500);
       return;
     }
 
     currentMoveSourceType = typesArr[0] || 'dvbs';
+    currentMoveChannels = selList.slice().sort(function (a, b) { return a.num - b.num; });
 
     var k = currentMoveChannels.length;
     var chListText = [];
@@ -2039,11 +2171,13 @@
       return;
     }
 
-    var chNums = [];
+    var srvIds = [];
     for (var i = 0; i < currentMoveChannels.length; i++) {
-      chNums.push(currentMoveChannels[i].num);
+      if (currentMoveChannels[i].srvId) {
+        srvIds.push(String(currentMoveChannels[i].srvId));
+      }
     }
-
+    var firstMovedKey = currentMoveChannels.length > 0 ? getChannelKey(currentMoveChannels[0]) : '';
     var sourceType = currentMoveSourceType || 'dvbs';
     closeMoveModal();
     showToast('⏳ Moving ' + k + ' channel' + (k > 1 ? 's' : '') + ' to #' + targetNum + '…', 4000);
@@ -2053,7 +2187,7 @@
       headers: { 'Content-Type': 'text/plain' },
       body: JSON.stringify({
         action: 'move',
-        channels: chNums,
+        srvIds: srvIds,
         target: targetNum,
         type: sourceType
       })
@@ -2062,45 +2196,29 @@
     .then(function (data) {
       if (data.ok) {
         showToast('✅ Moved ' + k + ' channel' + (k > 1 ? 's' : '') + ' to #' + targetNum + (k > 1 ? (' - #' + (targetNum + k - 1)) : '') + ' (' + (data.changed || 0) + ' total shifted)', 3500);
+        if ((data.changed || 0) > 0) {
+          setPendingReload(data.pendingReload !== false);
+        }
 
         if (data.changes && data.changes.length > 0) {
           var changeMapBySrvId = {};
-          var changeMapByMajor = {};
           for (var c = 0; c < data.changes.length; c++) {
             var chg = data.changes[c];
-            if (chg.srvId) changeMapBySrvId[chg.srvId] = chg.newMajor;
-            changeMapByMajor[chg.oldMajor] = chg.newMajor;
+            if (chg.srvId) changeMapBySrvId[String(chg.srvId)] = chg.newMajor;
           }
 
-          var newSelected = {};
           for (var a = 0; a < allChannels.length; a++) {
             var ach = allChannels[a];
-            if (ach.type === sourceType || (!ach.type && sourceType === 'dvbs')) {
-              var newM = null;
-              if (ach.srvId && changeMapBySrvId.hasOwnProperty(ach.srvId)) {
-                newM = changeMapBySrvId[ach.srvId];
-              } else if (changeMapByMajor.hasOwnProperty(ach.num)) {
-                newM = changeMapByMajor[ach.num];
-              }
-
-              if (newM !== null) {
-                var wasSel = !!selectedChannels[ach.num];
-                ach.num = newM;
-                if (wasSel) {
-                  newSelected[newM] = true;
-                }
-              } else if (selectedChannels[ach.num]) {
-                newSelected[ach.num] = true;
-              }
+            if (getChannelDbType(ach) === sourceType && ach.srvId && changeMapBySrvId.hasOwnProperty(String(ach.srvId))) {
+              ach.num = changeMapBySrvId[String(ach.srvId)];
             }
           }
-          selectedChannels = newSelected;
         }
 
         applyFilters();
 
         setTimeout(function () {
-          var firstTargetCard = listEl.querySelector('.channel-card[data-ch="' + targetNum + '"]');
+          var firstTargetCard = firstMovedKey ? listEl.querySelector('.channel-card[data-key="' + firstMovedKey + '"]') : null;
           if (firstTargetCard) {
             firstTargetCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
             firstTargetCard.style.outline = '2px solid #a855f7';
@@ -2314,10 +2432,6 @@
   }
 
   // Reload TV buttons (Editor Toolbar & Sticky Header)
-  var btnReloadTv = document.getElementById('btn-reload-tv');
-  var btnStickyReload = document.getElementById('btn-sticky-reload');
-  var editorBar = document.getElementById('editor-bar');
-
   function triggerReloadTv() {
     showToast('🔄 Flushing TV channel manager…', 3000);
     if (btnReloadTv) btnReloadTv.classList.add('loading');
@@ -2329,6 +2443,7 @@
         if (btnStickyReload) btnStickyReload.classList.remove('loading');
         if (data.ok) {
           showToast('✅ TV channel manager reloaded!', 2500);
+          setPendingReload(!!data.pendingReload);
           fetchChannels(true);
         } else {
           showToast('⚠️ Reload failed: ' + (data.error || 'error'), 3000);
