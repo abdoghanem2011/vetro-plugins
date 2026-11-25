@@ -58,15 +58,15 @@
     {
       "id": "keyboard",
       "name": "Keyboard & Remote",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "author": "abdoghanem2011",
       "description": "Text input, live MJPEG/1080p screen preview, and full TV remote. Connects browser to TV port 8002 (WSS); streams via 127.0.0.1.",
       "permissions": [
         "exec"
       ],
-      "url": "dist/keyboard-1.1.0.vplugin",
-      "sha256": "7146f1297f23e0ab56ef9d158c4a73051fa9f0dfdd899640c179fa39f5ceb8c5",
-      "size": 195944
+      "url": "dist/keyboard-1.1.1.vplugin",
+      "sha256": "648c67cb41627059e9e61f5ea4d183b161f4ee17084a1f2f46fd58bfe33181d2",
+      "size": 197614
     },
     {
       "id": "notification-center",

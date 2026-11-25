@@ -138,6 +138,17 @@ function readJson(req, maxBytes, callback) {
 
 module.exports = function (ctx) {
 
+    var inputDevicesPath = (ctx && ctx._inputDevicesPath) ? String(ctx._inputDevicesPath) : '/proc/bus/input/devices';
+    var arpPath = (ctx && ctx._arpPath) ? String(ctx._arpPath) : '/proc/net/arp';
+    var MOUSE_NODE_CACHE_MS = 30000;
+    var cachedMouseNode = null;
+    var cachedMouseNodeAt = 0;
+
+    function invalidateMouseNodeCache() {
+        cachedMouseNode = null;
+        cachedMouseNodeAt = 0;
+    }
+
     var page = null;
     var activeHoldTimer = null;
     var activeHoldKey = null;
@@ -152,10 +163,14 @@ module.exports = function (ctx) {
     var mouseQueue = [];
 
     function findMouseNode() {
+        if (cachedMouseNode && (Date.now() - cachedMouseNodeAt < MOUSE_NODE_CACHE_MS)) {
+            return cachedMouseNode;
+        }
         try {
-            var txt = fs.readFileSync('/proc/bus/input/devices', 'utf8');
+            var txt = fs.readFileSync(inputDevicesPath, 'utf8');
             var blocks = txt.split(/\n\s*\n/);
             var fallback = null;
+            var found = null;
             for (var i = 0; i < blocks.length; i++) {
                 var b = blocks[i];
                 var hm = /^H:\s*Handlers=(.*)$/m.exec(b);
@@ -163,10 +178,18 @@ module.exports = function (ctx) {
                 var em = /\bevent(\d{1,2})\b/.exec(hm[1]);
                 if (!em) continue;
                 var node = '/dev/input/event' + em[1];
-                if (/Remote-Input\(Mouse\)|SMART_VIEW/i.test(b)) return node;
+                if (/Remote-Input\(Mouse\)|SMART_VIEW/i.test(b)) {
+                    found = node;
+                    break;
+                }
                 if (!fallback) fallback = node;
             }
-            return fallback;
+            if (!found) found = fallback;
+            if (found) {
+                cachedMouseNode = found;
+                cachedMouseNodeAt = Date.now();
+            }
+            return found;
         } catch (e) {
             return null;
         }
@@ -349,12 +372,14 @@ module.exports = function (ctx) {
         function onOk(r) {
             if (!r || r.exit_code !== 0) {
                 mouseInitNode = null;
+                invalidateMouseNodeCache();
             }
             finishItem(r && r.exit_code === 0, r && r.stderr);
         }
 
         function onErr(e) {
             mouseInitNode = null;
+            invalidateMouseNodeCache();
             finishItem(false, undefined, e ? e.message : 'mouse command failed');
         }
 
@@ -837,6 +862,13 @@ module.exports = function (ctx) {
                         if (streamServer === srv) {
                             streamServer = null;
                             streamPort = 0;
+                            if (gen === streamGeneration) {
+                                streamProcRunning = false;
+                                if (streamKillTimer) {
+                                    clearTimeout(streamKillTimer);
+                                    streamKillTimer = null;
+                                }
+                            }
                         }
                         try { srv.close(); } catch (e) {}
                         return;
@@ -1004,7 +1036,7 @@ module.exports = function (ctx) {
     function lookupArpMac(ip) {
         if (!ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return null;
         try {
-            var arp = fs.readFileSync('/proc/net/arp', 'utf8');
+            var arp = fs.readFileSync(arpPath, 'utf8');
             var lines = arp.split('\n');
             for (var i = 1; i < lines.length; i++) {
                 var cols = lines[i].replace(/^\s+|\s+$/g, '').split(/\s+/);
@@ -1078,6 +1110,7 @@ module.exports = function (ctx) {
             stopHold();
             clearMouseQueue();
             stopMouseHold(true);
+            invalidateMouseNodeCache();
             closeAllStreamClients();
             stopStreamPipeline();
             clearScreenshotWaiters();
