@@ -1176,19 +1176,27 @@ test('Vetro TV Tuner integration: reload/import/restore restart tuner, CH+/CH-/E
     assert.equal(tuneHiddenTuner.json.method, 'direct');
     tunerShownSimulated = true;
 
-    // 3b. Hidden channel (#4, srvId='104') -> skips pipe, uses direct launch_app directly
+    // 3b. Hidden channel (#4, srvId='104') -> skips tune pipe, uses direct launch_app + hide/show resync when shown
     var logHiddenIdx = exec.log.length;
     var tuneHidden = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 4, srvId: '104' } });
     assert.equal(tuneHidden.status, 200);
     assert.equal(tuneHidden.json.method, 'direct');
-    assert.equal(exec.log[logHiddenIdx].cmd, '/usr/bin/launch_app org.tizen.tv-viewer tune_channel 104');
+    assert.match(exec.log[logHiddenIdx].cmd, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
+    assert.ok(exec.log[logHiddenIdx].script.indexOf('/usr/bin/launch_app org.tizen.tv-viewer tune_channel 104') >= 0);
+    assert.equal(exec.log[logHiddenIdx].script.indexOf("echo 'tune 4'"), -1);
+    assert.ok(exec.log[logHiddenIdx].script.indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    assert.ok(exec.log[logHiddenIdx].script.indexOf("printf 'hide\\nshow\\n'") >= 0);
 
-    // 3c. Duplicate visible Major (#5 exists in both dvbs srvId='5001' and ipsrv srvId='9001') -> skips pipe, uses direct launch_app
+    // 3c. Duplicate visible Major (#5 exists in both dvbs srvId='5001' and ipsrv srvId='9001') -> skips tune pipe, uses direct launch_app + hide/show resync
     var logDupIdx = exec.log.length;
     var tuneDup = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 5, srvId: '9001' } });
     assert.equal(tuneDup.status, 200);
     assert.equal(tuneDup.json.method, 'direct');
-    assert.equal(exec.log[logDupIdx].cmd, '/usr/bin/launch_app org.tizen.tv-viewer tune_channel 9001');
+    assert.match(exec.log[logDupIdx].cmd, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
+    assert.ok(exec.log[logDupIdx].script.indexOf('/usr/bin/launch_app org.tizen.tv-viewer tune_channel 9001') >= 0);
+    assert.equal(exec.log[logDupIdx].script.indexOf("echo 'tune 5'"), -1);
+    assert.ok(exec.log[logDupIdx].script.indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    assert.ok(exec.log[logDupIdx].script.indexOf("printf 'hide\\nshow\\n'") >= 0);
 
     // 3d. Digit fallback without srvId -> includes /tmp/vetro-tuner.ctl.shown + 'tune 42' + D-Bus fallback
     var logFbIdx = exec.log.length;
@@ -1199,14 +1207,18 @@ test('Vetro TV Tuner integration: reload/import/restore restart tuner, CH+/CH-/E
     assert.ok(exec.log[logFbIdx].script.indexOf("echo 'tune 42'") >= 0);
     assert.ok(exec.log[logFbIdx].script.indexOf('Test.EventKey') >= 0);
 
-    // 3e. pendingReload=true after an edit bypasses tuner pipe until reload completes
+    // 3e. pendingReload=true after an edit bypasses tune pipe and resyncs cursor after direct launch_app until reload completes
     var renRes = await invokeRoute(p, { method: 'POST', sub: 'edit', body: { action: 'rename', type: 'dvbs', srvId: '103', name: 'Gamma Renamed' } });
     assert.equal(renRes.status, 200);
     var logPendIdx = exec.log.length;
     var tunePending = await invokeRoute(p, { method: 'POST', sub: 'tune', body: { channel: 3, srvId: '103' } });
     assert.equal(tunePending.status, 200);
     assert.equal(tunePending.json.method, 'direct');
-    assert.equal(exec.log[logPendIdx].cmd, '/usr/bin/launch_app org.tizen.tv-viewer tune_channel 103');
+    assert.match(exec.log[logPendIdx].cmd, /^echo [A-Za-z0-9+/=]+ \| base64 -d \| sh$/);
+    assert.ok(exec.log[logPendIdx].script.indexOf('/usr/bin/launch_app org.tizen.tv-viewer tune_channel 103') >= 0);
+    assert.equal(exec.log[logPendIdx].script.indexOf("echo 'tune 3'"), -1);
+    assert.ok(exec.log[logPendIdx].script.indexOf('/tmp/vetro-tuner.ctl.shown') >= 0);
+    assert.ok(exec.log[logPendIdx].script.indexOf("printf 'hide\\nshow\\n'") >= 0);
 
     // 4. Reload, Phase 2 import swap, and restore-backup all include non-blocking vetro-tuner restart + quit fallback
     var relIdx = exec.log.length;

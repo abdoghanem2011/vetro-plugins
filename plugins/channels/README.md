@@ -43,7 +43,7 @@ Adds a unified **Channels** tab to the Vetro dashboard:
 | `/usr/bin/flock -n 9` | Serializes stopped-daemon swap, restore, and reload operations on `/tmp/vetro_channels_db.lock` |
 | `systemctl cat` / `stop` / `start` / `restart` `tvs_deamon.service` (fallback `tvs_daemon.service`, or `pkill -9 tvs-daemon` on reload only if unit absent) | Resolves the service unit, cleanly stops it during DB replacement, guarantees restart via shell `EXIT` trap, and restarts it on **Reload TV** |
 | `systemctl is-active` / `restart --no-block vetro-tuner.service` | Refreshes Vetro TV Tuner's cached channel list after `tvs-daemon` reloads (complete no-op when Vetro TV Tuner is not running) |
-| Non-blocking FIFO write (`exec 3<>/tmp/vetro-tuner.ctl`) | Sends `key 88` (`CH+`), `key 87` (`CH-`), `key 174` (`Exit`), `tune <N>`, `resume`, or `quit` when Vetro TV Tuner is active/on screen |
+| Non-blocking FIFO write (`exec 3<>/tmp/vetro-tuner.ctl`) | Sends `key 88` (`CH+`), `key 87` (`CH-`), `key 174` (`Exit`), `tune <N>`, `hide`/`show` (cursor resync after direct `srvId` tune), `resume`, or `quit` when Vetro TV Tuner is active/on screen |
 | `cp` / `cp -p` / `mv` / `chmod` / `chown` / `wc` | Manages atomic backup rotation into `<shard-dir>/backup/`, sets root permissions on TV DBs, and verifies extracted file sizes and symlinks |
 | `rm -f .../*-wal .../*-shm` / `rm -f` / `rm -rf` / `mkdir -p` | Removes stale WAL/SHM files while the daemon is stopped and cleans staging/temp files |
 | `cat` / `grep -i "^Version="` / `head` / `cut` / `tr` | Reads TV `metadata.xml` and `/etc/prd_info.ini` version/model metadata |

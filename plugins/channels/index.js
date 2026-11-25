@@ -42,6 +42,14 @@ var VETRO_TUNER_ALIVE_SH =
 var VETRO_TUNER_SHOWN_SH =
     VETRO_TUNER_ALIVE_SH + ' && [ -e ' + shQuote(VETRO_TUNER_SHOWN) + ' ]';
 
+// Trigger Activate() -> ResyncNow() in Vetro TV Tuner after a direct launch_app srvId tune while shown,
+// so Vetro's banner and CH+/- cursor sync to the exact newly tuned srvId even before a reload.
+var VETRO_TUNER_RESYNC_SH =
+    'if ' + VETRO_TUNER_SHOWN_SH + '; then ' +
+    'sleep 0.5; ' +
+    '( exec 3<>' + shQuote(VETRO_TUNER_PIPE) + ' && printf \'hide\\nshow\\n\' >&3 ) 2>/dev/null || true; ' +
+    'fi';
+
 // Restart Vetro TV Tuner after tvs-daemon restarts so it drops its cached channel list and reconnects.
 // Uses --no-block for Tizen 9 systemd/SMACK D-Bus compatibility; falls back to pipe 'quit' if started outside systemd.
 // Completely a no-op when Vetro TV Tuner is not installed or not running.
@@ -1560,8 +1568,10 @@ function channelsPlugin(ctx) {
                             return;
                         }
 
-                        var launchCmd = '/usr/bin/launch_app org.tizen.tv-viewer tune_channel ' + srvId;
-                        ctx.execute(launchCmd, 4000).then(function (r) {
+                        var directScript =
+                            '/usr/bin/launch_app org.tizen.tv-viewer tune_channel ' + srvId + ' </dev/null || exit $?; ' +
+                            VETRO_TUNER_RESYNC_SH;
+                        ctx.execute(wrapSh(directScript), 5000).then(function (r) {
                             sendJson(res, 200, { ok: r.exit_code === 0, channel: channel, srvId: srvId, method: 'direct' });
                         }, function (e) {
                             sendJson(res, 500, { ok: false, error: e.message });
