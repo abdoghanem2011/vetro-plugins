@@ -44,12 +44,18 @@ function createPluginHarness(t, opts) {
     var cfgData = opts.initialConfig ? JSON.parse(JSON.stringify(opts.initialConfig)) : {};
     var execLog = [];
     var configWrites = 0;
+    var dummyDotnet = path.join(files.root, 'dotnet');
+    if (opts.dotnetExists) {
+        fs.writeFileSync(dummyDotnet, '#!/bin/sh\n', 'utf8');
+    }
 
     var ctx = {
         id: 'keyboard',
         dir: files.root,
         _arpPath: files.arpFile,
         _inputDevicesPath: files.inputFile,
+        _dotnetPath: dummyDotnet,
+        _hwUnit: 'vetro-kbd-test',
         config: {
             get: function () { return cfgData; },
             set: function (val) {
@@ -150,10 +156,10 @@ function invokeRoute(plugin, opts) {
     });
 }
 
-function createStreamViewer(plugin) {
+function createStreamViewer(plugin, url) {
     var req = new stream.PassThrough();
     req.method = 'GET';
-    req.url = '/stream';
+    req.url = url || '/stream';
     req.headers = {};
     req.socket = { remoteAddress: '::ffff:192.168.1.10' };
 
@@ -462,10 +468,265 @@ test('findMouseNode caches device node across mouse requests and invalidates on 
         ''
     ].join('\n'), 'utf8');
     // Force init_device on next click by waiting for nothing? Wait: mouseInitNode is event7 so click skips init_device;
-    // verify stop() + start() clears cachedMouseNode so next request after restart resolves event9!
+    // Wait for init_device clear + verify stop() + start() clears cachedMouseNode so next request resolves event9!
     h.plugin.stop();
     h.plugin.start();
     var m4 = await invokeRoute(h.plugin, { method: 'POST', sub: 'mouse', body: { action: 'click', x: 140, y: 240 } });
     assert.equal(m4.json.ok, true);
     assert.ok(mouseCmds[mouseCmds.length - 1].indexOf('/dev/input/event9') >= 0);
+});
+
+// ==================== 4. HARDWARE CAPTURE & DUAL BINARY/MJPEG STREAM ====================
+
+function decodeWrapSh(cmd) {
+    var m = /^echo ([A-Za-z0-9+/=]+) \| base64 -d \| sh$/.exec(cmd || '');
+    return m ? Buffer.from(m[1], 'base64').toString('utf8') : cmd;
+}
+
+function makeFakeJpeg(tagByte, w, h) {
+    // Minimal valid JPEG with SOF0 header carrying (w, h)
+    var b = Buffer.alloc(20);
+    b[0] = 0xFF; b[1] = 0xD8; // SOI
+    b[2] = 0xFF; b[3] = 0xC0; // SOF0
+    b.writeUInt16BE(11, 4);
+    b[6] = 8;
+    b.writeUInt16BE(h, 7);
+    b.writeUInt16BE(w, 9);
+    b[11] = 1; b[12] = 1; b[13] = 0x11; b[14] = 0;
+    b[15] = tagByte & 0xFF;
+    b[16] = 0xFF; b[17] = 0xD9; // EOI
+    return b.slice(0, 18);
+}
+
+function makeBinFrame(jpeg, w, h) {
+    var hdr = Buffer.alloc(8);
+    hdr.writeUInt32BE(jpeg.length, 0);
+    hdr.writeUInt16BE(w, 4);
+    hdr.writeUInt16BE(h, 6);
+    return Buffer.concat([hdr, jpeg]);
+}
+
+test('hardware helper serves dual bin/mjpeg viewers, hot-swaps CAP quality, serves HD screenshots, and cleans up on stop()', async function (t) {
+    var hwLaunches = 0;
+    var hwStops = 0;
+    var hwPort = 0;
+    var hwSock = null;
+    var hwCmds = [];
+    var jpegFrameA = makeFakeJpeg(0xAA, 720, 576);
+    var jpegFrameB = makeFakeJpeg(0xBB, 720, 576);
+    var jpegHd = makeFakeJpeg(0xCC, 1920, 1080);
+
+    var h = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return {
+                    exit_code: 0,
+                    stdout: JSON.stringify({ ok: true, backend: 'secvideo', abi: 'ilp32', width: 720, height: 576 }),
+                    stderr: ''
+                };
+            }
+            var plain = decodeWrapSh(cmd);
+            if (plain.indexOf('--serve --port ') >= 0) {
+                hwLaunches++;
+                var pm = /--port (\d+)/.exec(plain);
+                hwPort = pm ? parseInt(pm[1], 10) : 0;
+                return { exit_code: 0, stdout: '', stderr: '' };
+            }
+            if (plain.indexOf('systemctl stop') >= 0) {
+                hwStops++;
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+
+    // Connect both a modern ?format=bin viewer and a legacy MJPEG viewer simultaneously
+    var vBin = createStreamViewer(h.plugin, '/stream?format=bin');
+    var vMjpeg = createStreamViewer(h.plugin, '/stream');
+    assert.equal(vBin.getHeaders()['content-type'], 'application/octet-stream');
+    assert.equal(vMjpeg.getHeaders()['content-type'], 'multipart/x-mixed-replace; boundary=--frame');
+
+    await waitUntil(function () { return hwPort > 0; });
+    assert.equal(fs.existsSync(path.join(h.files.root, 'runtime', 'hardware-streamer.dll')), true);
+
+    hwSock = await connectProducer(hwPort);
+    t.after(function () { try { hwSock.destroy(); } catch (e) {} });
+
+    var hwRxBuf = '';
+    hwSock.on('data', function (chunk) {
+        hwRxBuf += chunk.toString('ascii');
+        var idx;
+        while ((idx = hwRxBuf.indexOf('\n')) >= 0) {
+            var line = hwRxBuf.slice(0, idx).trim();
+            hwRxBuf = hwRxBuf.slice(idx + 1);
+            if (!line) continue;
+            hwCmds.push(line);
+            if (line.indexOf('CAP ') === 0) {
+                var q = parseInt(line.split(/\s+/)[3], 10);
+                var frame = (q >= 70) ? jpegFrameB : jpegFrameA;
+                hwSock.write(makeBinFrame(frame, 720, 576));
+            } else if (line.indexOf('HD ') === 0) {
+                hwSock.write(makeBinFrame(jpegHd, 1920, 1080));
+            }
+        }
+    });
+
+    hwSock.write('READY secvideo ilp32\n');
+    await waitUntil(function () {
+        return vBin.getData().indexOf(jpegFrameA) >= 0 && vMjpeg.getData().indexOf(jpegFrameA) >= 0;
+    });
+
+    // Validate binary framing header on vBin
+    var binOut = vBin.getData();
+    assert.equal(binOut.readUInt32BE(0), jpegFrameA.length);
+    assert.equal(binOut.readUInt16BE(4), 720);
+    assert.equal(binOut.readUInt16BE(6), 576);
+
+    // Preset/quality change hot-swaps CAP params without launching another helper process
+    var resPreset = await invokeRoute(h.plugin, { method: 'POST', sub: 'stream_preset', body: { preset: 'hd', quality: 82 } });
+    assert.equal(resPreset.status, 200);
+    await waitUntil(function () {
+        return hwCmds.some(function (c) { return c === 'CAP 1280 720 82'; }) &&
+            vBin.getData().indexOf(jpegFrameB) >= 0;
+    });
+    assert.equal(hwLaunches, 1, 'HW preset change must not respawn helper');
+
+    // GET api/status reports live capture state
+    var st = await invokeRoute(h.plugin, { method: 'GET', sub: 'status' });
+    assert.equal(st.status, 200);
+    assert.equal(st.json.capture.mode, 'auto');
+    assert.equal(st.json.capture.activeBackend, 'hw');
+    assert.equal(st.json.capture.hwAvailable, true);
+    assert.equal(st.json.capture.hwAbi, 'ilp32');
+
+    // GET api/screenshot during live HW stream uses warm HD command on loopback socket
+    var shotRes = await invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
+    assert.equal(shotRes.status, 200);
+    assert.equal(shotRes.headers['content-type'], 'image/jpeg');
+    assert.ok(hwCmds.some(function (c) { return c.indexOf('HD ') === 0; }));
+
+    // stop() sends QUIT\n and calls systemd stop command
+    h.plugin.stop();
+    await waitUntil(function () {
+        return hwStops >= 1 && hwCmds.indexOf('QUIT') >= 0;
+    });
+});
+
+// ==================== 5. ISOLATED PROBE CRASH & MID-STREAM FAILOVER ====================
+
+test('falls back cleanly to Wayland on --probe SIGSEGV and mid-stream consecutive HW errors', async function (t) {
+    // Subcase A: --probe segfaults (exit 139) -> uses Wayland directly
+    var gstLaunches = [];
+    var hSegv = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 139, stdout: '', stderr: 'Segmentation fault' };
+            }
+            if (cmd.indexOf('gst-launch-1.0') >= 0) {
+                gstLaunches.push(cmd);
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+    var vSegv = createStreamViewer(hSegv.plugin, '/stream?format=bin');
+    await waitUntil(function () { return gstLaunches.length === 1; });
+    var gstPort = extractStreamPort(gstLaunches[0]);
+    var gstProd = await connectProducer(gstPort);
+    t.after(function () { try { gstProd.destroy(); } catch (e) {} });
+    var wlJpeg = makeFakeJpeg(0x77, 960, 540);
+    gstProd.write(wlJpeg);
+    await waitUntil(function () { return vSegv.getData().indexOf(wlJpeg) >= 0; });
+    assert.equal(vSegv.getData().readUInt16BE(4), 960);
+    assert.equal(vSegv.getData().readUInt16BE(6), 540);
+    vSegv.disconnect();
+
+    // Subcase B: --probe succeeds, then HW returns 3 zero-length frames -> auto-failover to Wayland without dropping viewer
+    var sub2Gst = [];
+    var sub2HwPort = 0;
+    var hFailover = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 0, stdout: '{"ok":true,"backend":"secvideo","abi":"ilp32"}', stderr: '' };
+            }
+            var plain = decodeWrapSh(cmd);
+            if (plain.indexOf('--serve --port ') >= 0) {
+                var pm = /--port (\d+)/.exec(plain);
+                sub2HwPort = pm ? parseInt(pm[1], 10) : 0;
+                return { exit_code: 0, stdout: '', stderr: '' };
+            }
+            if (cmd.indexOf('gst-launch-1.0') >= 0) {
+                sub2Gst.push(cmd);
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+
+    var vFail = createStreamViewer(hFailover.plugin, '/stream?format=bin');
+    await waitUntil(function () { return sub2HwPort > 0; });
+    var hwSock2 = await connectProducer(sub2HwPort);
+    t.after(function () { try { hwSock2.destroy(); } catch (e) {} });
+    hwSock2.on('data', function (chunk) {
+        if (chunk.toString('ascii').indexOf('CAP ') >= 0) {
+            // Send 8-byte zero frame header (capture failure)
+            hwSock2.write(Buffer.alloc(8));
+        }
+    });
+    hwSock2.write('READY secvideo ilp32\n');
+
+    await waitUntil(function () { return sub2Gst.length === 1; });
+    assert.equal(vFail.isEnded(), false, 'viewer must remain connected across mid-stream HW->Wayland failover');
+    var stFail = await invokeRoute(hFailover.plugin, { method: 'GET', sub: 'status' });
+    assert.equal(stFail.json.capture.activeBackend, 'wayland');
+    assert.equal(stFail.json.capture.hwReason, 'hw_consecutive_errors');
+});
+
+// ==================== 6. CAPTURE MODE TOGGLE & PERSISTENCE ====================
+
+test('POST api/capture_mode validates, persists, and switches live backend between Auto and Wayland', async function (t) {
+    var gstCount = 0;
+    var hwCount = 0;
+    var lastHwPort = 0;
+    var h = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 0, stdout: '{"ok":true,"backend":"secvideo","abi":"ilp32"}', stderr: '' };
+            }
+            var plain = decodeWrapSh(cmd);
+            if (plain.indexOf('--serve --port ') >= 0) {
+                hwCount++;
+                var pm = /--port (\d+)/.exec(plain);
+                lastHwPort = pm ? parseInt(pm[1], 10) : 0;
+            } else if (cmd.indexOf('gst-launch-1.0') >= 0) {
+                gstCount++;
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+
+    var bad = await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'invalid' } });
+    assert.equal(bad.status, 400);
+
+    var viewer = createStreamViewer(h.plugin, '/stream');
+    await waitUntil(function () { return hwCount === 1 && lastHwPort > 0; });
+    var hs = await connectProducer(lastHwPort);
+    t.after(function () { try { hs.destroy(); } catch (e) {} });
+    hs.write('READY secvideo ilp32\n');
+
+    // Switch live to Wayland
+    var swWayland = await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'wayland' } });
+    assert.equal(swWayland.status, 200);
+    assert.equal(swWayland.json.capture.mode, 'wayland');
+    assert.equal(h.getConfig().captureMode, 'wayland');
+    await waitUntil(function () { return gstCount === 1; });
+    assert.equal(viewer.isEnded(), false);
+
+    // Switch back to Auto
+    var swAuto = await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'auto' } });
+    assert.equal(swAuto.status, 200);
+    assert.equal(swAuto.json.capture.mode, 'auto');
+    assert.equal(h.getConfig().captureMode, 'auto');
+    await waitUntil(function () { return hwCount === 2; });
 });

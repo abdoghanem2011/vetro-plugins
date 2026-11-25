@@ -18,6 +18,7 @@ var path = require('path');
 var os = require('os');
 var net = require('net');
 var crypto = require('crypto');
+var zlib = require('zlib');
 
 var MAX_TOKEN_DEVICES = 16;
 
@@ -474,12 +475,36 @@ module.exports = function (ctx) {
         "fi ;; esac; " +
         "rm -f " + STREAM_PID_FILE + "; fi";
 
+    var dotnetPath = (ctx && ctx._dotnetPath) ? String(ctx._dotnetPath) : '/usr/bin/dotnet';
+    var hwUnit = (ctx && ctx._hwUnit) ? String(ctx._hwUnit) : 'vetro-keyboard-capture';
+    if (!/^[A-Za-z0-9_.-]+$/.test(hwUnit)) hwUnit = 'vetro-keyboard-capture';
+    var hwRuntimeDir = path.join(ctx.dir || __dirname, 'runtime');
+    var hwDllPath = path.join(hwRuntimeDir, 'hardware-streamer.dll');
+    var hwPidFile = path.join(hwRuntimeDir, 'hw.pid');
+    var hwMaterializedSha = null;
+    var captureMode = 'auto';
+    var hwFailedRuntime = false;
+    var activeStreamBackend = 'idle';
+    var hwProbe = {
+        probed: false,
+        hwAvailable: false,
+        hwBackend: null,
+        hwAbi: null,
+        hwArch: process.arch || 'unknown',
+        hwReason: 'not_probed'
+    };
+    var hwProbeWaiters = null;
+
     var streamClients = [];
     var streamProcRunning = false;
+    var streamProducerType = null; // 'hw' | 'wayland' | null
     var streamServer = null;
     var streamPort = 0;
     var streamTcpSocket = null;
+    var hwConnState = null;
     var lastFrame = null;
+    var lastFrameWidth = 0;
+    var lastFrameHeight = 0;
     var lastFrameTime = 0;
     var streamKillTimer = null;
     var streamNoConnectTimer = null;
@@ -496,6 +521,197 @@ module.exports = function (ctx) {
         return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(Number(v));
     }
 
+    function shQuote(val) {
+        return "'" + String(val).replace(/'/g, "'\\''") + "'";
+    }
+
+    function wrapSh(script) {
+        var bytes = (typeof Buffer.from === 'function') ? Buffer.from(script, 'utf8') : new Buffer(script, 'utf8');
+        return 'echo ' + bytes.toString('base64') + ' | base64 -d | sh';
+    }
+
+    function stopHwCmd() {
+        return wrapSh(
+            'systemctl stop --no-block ' + shQuote(hwUnit + '.service') + ' >/dev/null 2>&1 || true\n' +
+            'if [ -f ' + shQuote(hwPidFile) + ' ]; then\n' +
+            '  pid=$(cat ' + shQuote(hwPidFile) + ' 2>/dev/null)\n' +
+            '  case "$pid" in ""|*[!0-9]*) ;; *) ' +
+            '    if tr "\\0" " " < /proc/"$pid"/cmdline 2>/dev/null | grep -q "hardware-streamer\\.dll"; then ' +
+            '      kill "$pid" 2>/dev/null; sleep 0.15; kill -9 "$pid" 2>/dev/null; ' +
+            '    fi ;; esac\n' +
+            '  rm -f ' + shQuote(hwPidFile) + '\n' +
+            'fi'
+        );
+    }
+
+    function ensureHelperMaterialized() {
+        var gzB64Path = path.join(__dirname, 'hardware-streamer.dll.gz.b64');
+        var rcPath = path.join(__dirname, 'hardware-streamer.runtimeconfig.json');
+        var depsPath = path.join(__dirname, 'hardware-streamer.deps.json');
+        if (!fs.existsSync(hwRuntimeDir)) {
+            fs.mkdirSync(hwRuntimeDir, 448); // 0700 owned by Vetro UID
+        }
+        var dirStat = fs.lstatSync(hwRuntimeDir);
+        if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+            throw new Error('Unsafe runtime directory');
+        }
+        var encoded = fs.readFileSync(gzB64Path, 'utf8').trim();
+        var compressed = (typeof Buffer.from === 'function') ? Buffer.from(encoded, 'base64') : new Buffer(encoded, 'base64');
+        var dllBytes = zlib.gunzipSync(compressed);
+        var expectedSha = crypto.createHash('sha256').update(dllBytes).digest('hex');
+
+        function syncFile(targetPath, bufOrText, checkSha) {
+            var needsWrite = true;
+            if (fs.existsSync(targetPath)) {
+                var st = fs.lstatSync(targetPath);
+                if (st.isSymbolicLink() || !st.isFile()) {
+                    throw new Error('Unsafe runtime file: ' + targetPath);
+                }
+                if (checkSha) {
+                    var existingSha = crypto.createHash('sha256').update(fs.readFileSync(targetPath)).digest('hex');
+                    if (existingSha === expectedSha) needsWrite = false;
+                } else {
+                    if (fs.readFileSync(targetPath, 'utf8') === bufOrText) needsWrite = false;
+                }
+            }
+            if (needsWrite) {
+                var tmpPath = targetPath + '.new';
+                fs.writeFileSync(tmpPath, bufOrText, { mode: 384 }); // 0600
+                fs.renameSync(tmpPath, targetPath);
+            }
+        }
+
+        if (hwMaterializedSha !== expectedSha || !fs.existsSync(hwDllPath)) {
+            syncFile(hwDllPath, dllBytes, true);
+            syncFile(path.join(hwRuntimeDir, 'hardware-streamer.runtimeconfig.json'), fs.readFileSync(rcPath, 'utf8'), false);
+            syncFile(path.join(hwRuntimeDir, 'hardware-streamer.deps.json'), fs.readFileSync(depsPath, 'utf8'), false);
+            hwMaterializedSha = expectedSha;
+        }
+        return hwDllPath;
+    }
+
+    function getCaptureStatusSnapshot() {
+        return {
+            mode: captureMode,
+            activeBackend: activeStreamBackend,
+            hwAvailable: hwProbe.probed ? hwProbe.hwAvailable : null,
+            hwBackend: hwProbe.hwBackend,
+            hwArch: hwProbe.hwArch,
+            hwAbi: hwProbe.hwAbi,
+            hwReason: hwProbe.hwReason
+        };
+    }
+
+    function probeHardwareCapture(callback) {
+        if (hwProbe.probed) {
+            callback(hwProbe);
+            return;
+        }
+        if (!fs.existsSync(dotnetPath)) {
+            hwProbe = {
+                probed: true,
+                hwAvailable: false,
+                hwBackend: null,
+                hwAbi: null,
+                hwArch: process.arch || 'unknown',
+                hwReason: 'dotnet_missing'
+            };
+            callback(hwProbe);
+            return;
+        }
+        var dll;
+        try {
+            dll = ensureHelperMaterialized();
+        } catch (err) {
+            hwProbe = {
+                probed: true,
+                hwAvailable: false,
+                hwBackend: null,
+                hwAbi: null,
+                hwArch: process.arch || 'unknown',
+                hwReason: 'materialize_failed:' + (err && err.message ? err.message : 'err')
+            };
+            callback(hwProbe);
+            return;
+        }
+
+        if (hwProbeWaiters) {
+            hwProbeWaiters.push(callback);
+            return;
+        }
+        hwProbeWaiters = [callback];
+
+        function finishProbe(result) {
+            hwProbe = result;
+            var waiters = hwProbeWaiters || [];
+            hwProbeWaiters = null;
+            for (var i = 0; i < waiters.length; i++) {
+                try { waiters[i](hwProbe); } catch (e) {}
+            }
+        }
+
+        var arch = process.arch || 'unknown';
+        var abis = (arch === 'arm' || arch === 'ia32') ? ['ilp32'] : ['lp64-int', 'lp64-sizet'];
+        var idx = 0;
+        var lastReason = 'probe_failed';
+
+        function tryNextAbi() {
+            if (idx >= abis.length) {
+                finishProbe({
+                    probed: true,
+                    hwAvailable: false,
+                    hwBackend: null,
+                    hwAbi: null,
+                    hwArch: arch,
+                    hwReason: lastReason
+                });
+                return;
+            }
+            var abi = abis[idx++];
+            var cmd = 'DOTNET_ROLL_FORWARD=Major ' + shQuote(dotnetPath) + ' ' + shQuote(dll) + ' --probe --abi ' + abi;
+            try {
+                ctx.execute(cmd, 4000).then(function (r) {
+                    if (r && r.exit_code === 0 && typeof r.stdout === 'string') {
+                        try {
+                            var parsed = JSON.parse(r.stdout.trim());
+                            if (parsed && parsed.ok === true) {
+                                finishProbe({
+                                    probed: true,
+                                    hwAvailable: true,
+                                    hwBackend: parsed.backend || 'secvideo',
+                                    hwAbi: parsed.abi || abi,
+                                    hwArch: arch,
+                                    hwReason: 'ok'
+                                });
+                                return;
+                            }
+                            if (parsed && parsed.reason) lastReason = String(parsed.reason);
+                        } catch (pe) {
+                            lastReason = 'probe_bad_json';
+                        }
+                    } else if (r && typeof r.stdout === 'string') {
+                        try {
+                            var failObj = JSON.parse(r.stdout.trim());
+                            if (failObj && failObj.reason) lastReason = String(failObj.reason);
+                            else lastReason = 'exit_' + (r.exit_code !== undefined ? r.exit_code : 'err');
+                        } catch (pe2) {
+                            lastReason = r.timed_out ? 'probe_timeout' : ('exit_' + (r.exit_code !== undefined ? r.exit_code : 'err'));
+                        }
+                    }
+                    tryNextAbi();
+                }, function (e) {
+                    lastReason = (e && e.message) ? String(e.message) : 'probe_exec_err';
+                    tryNextAbi();
+                });
+            } catch (syncErr) {
+                lastReason = syncErr && syncErr.message ? syncErr.message : 'probe_sync_err';
+                tryNextAbi();
+            }
+        }
+
+        tryNextAbi();
+    }
+
     function getStreamConfig() {
         return {
             preset: streamPreset,
@@ -510,6 +726,7 @@ module.exports = function (ctx) {
         streamWidth = STREAM_PRESETS.balanced.width;
         streamHeight = STREAM_PRESETS.balanced.height;
         streamQuality = STREAM_PRESETS.balanced.quality;
+        captureMode = 'auto';
         try {
             var cfg = getCfg();
             if (typeof cfg.streamPreset === 'string' &&
@@ -522,37 +739,28 @@ module.exports = function (ctx) {
             if (isFiniteQuality(cfg.streamQuality)) {
                 streamQuality = Math.max(20, Math.min(95, Math.round(Number(cfg.streamQuality))));
             }
+            if (cfg.captureMode === 'wayland' || cfg.captureMode === 'auto') {
+                captureMode = cfg.captureMode;
+            }
         } catch (e) {}
     }
 
-    function scheduleStreamRestart() {
+    function scheduleStreamRestart(forceRestart) {
         if (streamRestartTimer) {
             clearTimeout(streamRestartTimer);
             streamRestartTimer = null;
         }
         if (!streamProcRunning || streamClients.length === 0) return;
+        // HW helper applies new dimensions/quality on the very next pull-paced CAP frame without restarting.
+        if (!forceRestart && streamProducerType === 'hw' && hwConnState && hwConnState.ready) {
+            pumpHwLoop();
+            return;
+        }
         streamRestartTimer = setTimeout(function () {
             streamRestartTimer = null;
             try {
                 if (streamClients.length === 0) return;
-                if (streamNoConnectTimer) {
-                    clearTimeout(streamNoConnectTimer);
-                    streamNoConnectTimer = null;
-                }
-                if (streamTcpSocket) {
-                    var oldSock = streamTcpSocket;
-                    streamTcpSocket = null;
-                    try { oldSock.destroy(); } catch (e) {}
-                }
-                if (streamServer && streamPort === 0) {
-                    var oldSrv = streamServer;
-                    streamServer = null;
-                    try { oldSrv.close(); } catch (e) {}
-                }
-                streamPipelineRestarts = 0;
-                lastFrame = null;
-                lastFrameTime = 0;
-                streamProcRunning = false;
+                stopStreamPipeline(true);
                 startStreamPipeline();
             } catch (e) {}
         }, 200);
@@ -589,7 +797,7 @@ module.exports = function (ctx) {
                     } catch (e) {}
                 }
                 if (streamProcRunning && streamClients.length > 0) {
-                    scheduleStreamRestart();
+                    scheduleStreamRestart(false);
                 }
             }
         }
@@ -602,6 +810,38 @@ module.exports = function (ctx) {
 
     function asciiBuf(str) {
         return (typeof Buffer.from === 'function') ? Buffer.from(str, 'ascii') : new Buffer(str, 'ascii');
+    }
+
+    function writeFrameHeader8(jpegLen, width, height) {
+        var h = allocBuf(8);
+        h.writeUInt32BE(jpegLen >>> 0, 0);
+        h.writeUInt16BE(Math.max(0, Math.min(65535, width | 0)), 4);
+        h.writeUInt16BE(Math.max(0, Math.min(65535, height | 0)), 6);
+        return h;
+    }
+
+    function parseJpegDimensions(buf) {
+        if (!buf || buf.length < 16 || buf[0] !== 0xFF || buf[1] !== 0xD8) return null;
+        var i = 2;
+        while (i + 9 < buf.length) {
+            if (buf[i] !== 0xFF) { i++; continue; }
+            while (i < buf.length && buf[i] === 0xFF) i++;
+            if (i >= buf.length) break;
+            var marker = buf[i++];
+            if (marker === 0xD9 || marker === 0xDA) break;
+            if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+            if (i + 2 > buf.length) break;
+            var segLen = buf.readUInt16BE(i);
+            if (segLen < 2 || i + segLen > buf.length) break;
+            if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) ||
+                (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+                if (segLen >= 7 && i + 7 < buf.length) {
+                    return { height: buf.readUInt16BE(i + 3), width: buf.readUInt16BE(i + 5) };
+                }
+            }
+            i += segLen;
+        }
+        return null;
     }
 
     function createJpegParser(onFrame) {
@@ -685,7 +925,7 @@ module.exports = function (ctx) {
         streamClients = [];
     }
 
-    function writeMjpegClient(c, payload) {
+    function writeStreamClient(c, payload) {
         if (!c || c.closed) return;
         c.busy = true;
         c.lastSendTime = Date.now();
@@ -693,6 +933,9 @@ module.exports = function (ctx) {
             c.res.write(payload, function () {
                 c.busy = false;
                 c.lastWriteOk = Date.now();
+                if (streamProducerType === 'hw' && hwConnState && hwConnState.ready && !hwConnState.inFlight) {
+                    pumpHwLoop();
+                }
             });
         } catch (e) {
             c.busy = false;
@@ -700,14 +943,31 @@ module.exports = function (ctx) {
         }
     }
 
-    function broadcastFrame(frame) {
+    function buildClientFramePacket(format, frame, w, h) {
+        if (format === 'bin') {
+            return Buffer.concat([writeFrameHeader8(frame.length, w, h), frame]);
+        }
+        var partHdr = asciiBuf('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + frame.length + '\r\n\r\n');
+        return Buffer.concat([partHdr, frame, asciiBuf('\r\n')]);
+    }
+
+    function broadcastFrame(frame, optWidth, optHeight) {
         if (!frame || frame.length === 0) return;
+        var w = optWidth || 0;
+        var h = optHeight || 0;
+        if (!w || !h) {
+            var dims = parseJpegDimensions(frame);
+            w = (dims && dims.width) ? dims.width : streamWidth;
+            h = (dims && dims.height) ? dims.height : streamHeight;
+        }
         var now = Date.now();
         lastFrame = frame;
+        lastFrameWidth = w;
+        lastFrameHeight = h;
         lastFrameTime = now;
         if (streamClients.length === 0) return;
-        var partHdr = asciiBuf('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + frame.length + '\r\n\r\n');
-        var payload = Buffer.concat([partHdr, frame, asciiBuf('\r\n')]);
+        var binPayload = null;
+        var mjpegPayload = null;
         for (var i = streamClients.length - 1; i >= 0; i--) {
             var c = streamClients[i];
             if (!c || c.closed || !c.res || !c.res.socket || !c.res.socket.writable || c.res.finished) {
@@ -715,13 +975,186 @@ module.exports = function (ctx) {
                 continue;
             }
             if (isClientReady(c)) {
-                writeMjpegClient(c, payload);
+                var pkt;
+                if (c.format === 'bin') {
+                    if (!binPayload) binPayload = buildClientFramePacket('bin', frame, w, h);
+                    pkt = binPayload;
+                } else {
+                    if (!mjpegPayload) mjpegPayload = buildClientFramePacket('mjpeg', frame, w, h);
+                    pkt = mjpegPayload;
+                }
+                writeStreamClient(c, pkt);
             } else if ((now - c.lastWriteOk) > 15000) {
                 try { c.res.end(); } catch (e) {}
                 try { c.res.socket.destroy(); } catch (e) {}
                 removeStreamClient(c);
             }
         }
+    }
+
+    function clearHwConnTimers(st) {
+        if (!st) return;
+        if (st.inFlightTimer) {
+            clearTimeout(st.inFlightTimer);
+            st.inFlightTimer = null;
+        }
+        if (st.paceTimer) {
+            clearTimeout(st.paceTimer);
+            st.paceTimer = null;
+        }
+    }
+
+    function anyStreamClientReady() {
+        for (var i = 0; i < streamClients.length; i++) {
+            if (isClientReady(streamClients[i])) return true;
+        }
+        return false;
+    }
+
+    function failoverHwToWayland(reason) {
+        hwFailedRuntime = true;
+        hwProbe.hwReason = String(reason || 'hw_failed');
+        if (screenshotWaiters) {
+            runWaylandScreenshotCapture();
+        }
+        if (streamClients.length > 0 && streamProcRunning) {
+            stopStreamPipeline(true);
+            startStreamPipeline();
+        } else {
+            stopStreamPipeline(false);
+        }
+    }
+
+    function pumpHwLoop() {
+        var st = hwConnState;
+        var sock = streamTcpSocket;
+        if (!st || !sock || !st.ready || st.inFlight || !streamProcRunning || streamProducerType !== 'hw') return;
+        if (st.gen !== streamGeneration) return;
+
+        if (screenshotWaiters && screenshotWaiters.length > 0 && captureMode === 'auto') {
+            st.inFlight = 'hd';
+            st.inFlightTimer = setTimeout(function () {
+                if (hwConnState === st && st.inFlight === 'hd') {
+                    failoverHwToWayland('hw_hd_timeout');
+                }
+            }, 6000);
+            try {
+                sock.write('HD 92\n');
+            } catch (e) {
+                failoverHwToWayland('hw_write_err');
+            }
+            return;
+        }
+
+        if (streamClients.length === 0) return;
+
+        if (!anyStreamClientReady()) {
+            if (!st.paceTimer) {
+                st.paceTimer = setTimeout(function () {
+                    if (hwConnState === st) {
+                        st.paceTimer = null;
+                        pumpHwLoop();
+                    }
+                }, 80);
+            }
+            return;
+        }
+
+        if (st.paceTimer) {
+            clearTimeout(st.paceTimer);
+            st.paceTimer = null;
+        }
+        st.inFlight = 'cap';
+        st.inFlightTimer = setTimeout(function () {
+            if (hwConnState === st && st.inFlight === 'cap') {
+                failoverHwToWayland('hw_cap_timeout');
+            }
+        }, 4000);
+        try {
+            sock.write('CAP ' + streamWidth + ' ' + streamHeight + ' ' + streamQuality + '\n');
+        } catch (e) {
+            failoverHwToWayland('hw_write_err');
+        }
+    }
+
+    function createHwSocketHandler(sock, gen) {
+        var st = {
+            gen: gen,
+            ready: false,
+            inFlight: null,
+            inFlightTimer: null,
+            paceTimer: null,
+            consecutiveErrors: 0,
+            buf: allocBuf(0)
+        };
+        hwConnState = st;
+
+        return function (chunk) {
+            try {
+                if (hwConnState !== st || gen !== streamGeneration || !chunk || chunk.length === 0) return;
+                st.buf = Buffer.concat([st.buf, chunk]);
+                if (st.buf.length > 16777216) {
+                    failoverHwToWayland('hw_frame_overflow');
+                    return;
+                }
+
+                if (!st.ready) {
+                    var nl = st.buf.indexOf(10); // '\n'
+                    if (nl === -1) return;
+                    var line = st.buf.slice(0, nl).toString('ascii').trim();
+                    st.buf = st.buf.slice(nl + 1);
+                    if (line.indexOf('READY ') !== 0) {
+                        failoverHwToWayland('hw_bad_handshake');
+                        return;
+                    }
+                    st.ready = true;
+                    activeStreamBackend = 'hw';
+                    pumpHwLoop();
+                }
+
+                while (st.inFlight && st.buf.length >= 8) {
+                    var frameLen = st.buf.readUInt32BE(0);
+                    var fw = st.buf.readUInt16BE(4);
+                    var fh = st.buf.readUInt16BE(6);
+                    if (frameLen > 16777216) {
+                        failoverHwToWayland('hw_frame_too_large');
+                        return;
+                    }
+                    if (st.buf.length < 8 + frameLen) break;
+
+                    var jpeg = st.buf.slice(8, 8 + frameLen);
+                    st.buf = st.buf.slice(8 + frameLen);
+                    var kind = st.inFlight;
+                    st.inFlight = null;
+                    if (st.inFlightTimer) {
+                        clearTimeout(st.inFlightTimer);
+                        st.inFlightTimer = null;
+                    }
+
+                    if (kind === 'hd') {
+                        if (frameLen > 8 && jpeg[0] === 0xFF && jpeg[1] === 0xD8) {
+                            finishShotOk('image/jpeg', jpeg);
+                        } else if (screenshotWaiters) {
+                            runWaylandScreenshotCapture();
+                        }
+                    } else if (kind === 'cap') {
+                        if (frameLen === 0) {
+                            st.consecutiveErrors++;
+                            if (st.consecutiveErrors >= 3) {
+                                failoverHwToWayland('hw_consecutive_errors');
+                                return;
+                            }
+                        } else {
+                            st.consecutiveErrors = 0;
+                            broadcastFrame(jpeg, fw, fh);
+                        }
+                    }
+                    pumpHwLoop();
+                }
+            } catch (e) {
+                failoverHwToWayland('hw_parser_error');
+            }
+        };
     }
 
     function onStreamSocket(sock) {
@@ -738,6 +1171,8 @@ module.exports = function (ctx) {
             if (streamTcpSocket) {
                 var prev = streamTcpSocket;
                 streamTcpSocket = null;
+                clearHwConnTimers(hwConnState);
+                hwConnState = null;
                 try { prev.destroy(); } catch (e) {}
             }
             streamTcpSocket = sock;
@@ -747,7 +1182,16 @@ module.exports = function (ctx) {
             }
             streamPipelineRestarts = 0;
             if (sock.setNoDelay) sock.setNoDelay(true);
-            sock.on('data', createJpegParser(broadcastFrame));
+
+            var connGen = streamGeneration;
+            if (streamProducerType === 'hw') {
+                sock.on('data', createHwSocketHandler(sock, connGen));
+            } else {
+                activeStreamBackend = 'wayland';
+                sock.on('data', createJpegParser(function (frame) {
+                    broadcastFrame(frame, 0, 0);
+                }));
+            }
 
             var handleDisconnect = function () {
                 try {
@@ -756,9 +1200,13 @@ module.exports = function (ctx) {
                         return;
                     }
                     streamTcpSocket = null;
+                    clearHwConnTimers(hwConnState);
+                    hwConnState = null;
                     try { sock.destroy(); } catch (e) {}
-                    if (streamClients.length > 0 && streamProcRunning && !streamRestartTimer) {
-                        if (streamPipelineRestarts < 1) {
+                    if (streamClients.length > 0 && streamProcRunning && !streamRestartTimer && connGen === streamGeneration) {
+                        if (streamProducerType === 'hw' && captureMode === 'auto') {
+                            failoverHwToWayland('hw_helper_disconnected');
+                        } else if (streamPipelineRestarts < 1) {
                             streamPipelineRestarts++;
                             streamProcRunning = false;
                             startStreamPipeline();
@@ -774,6 +1222,64 @@ module.exports = function (ctx) {
             sock.on('close', handleDisconnect);
         } catch (e) {
             try { sock.destroy(); } catch (e2) {}
+        }
+    }
+
+    function launchHwHelper(gen, port) {
+        if (!streamProcRunning || gen !== streamGeneration) return;
+        var abi = hwProbe.hwAbi || ((process.arch === 'arm' || process.arch === 'ia32') ? 'ilp32' : 'lp64-int');
+        var dll;
+        try {
+            dll = ensureHelperMaterialized();
+        } catch (err) {
+            failoverHwToWayland('materialize_failed');
+            return;
+        }
+        var args = shQuote(dll) + ' --serve --port ' + port + ' --abi ' + abi + ' --timeout 60';
+        var startSh =
+            'systemctl stop --no-block ' + shQuote(hwUnit + '.service') + ' >/dev/null 2>&1 || true\n' +
+            'systemctl reset-failed ' + shQuote(hwUnit + '.service') + ' >/dev/null 2>&1 || true\n' +
+            'rm -f ' + shQuote(hwPidFile) + '\n' +
+            'launched=0\n' +
+            'if command -v systemd-run >/dev/null 2>&1; then\n' +
+            '  systemd-run --unit=' + shQuote(hwUnit) + ' --collect ' +
+            '-p Environment=DOTNET_ROLL_FORWARD=Major ' +
+            '-p StandardOutput=null -p StandardError=null ' +
+            shQuote(dotnetPath) + ' ' + args + ' </dev/null >/dev/null 2>&1 && launched=1\n' +
+            'fi\n' +
+            'if [ "$launched" -eq 0 ]; then\n' +
+            '  DOTNET_ROLL_FORWARD=Major setsid nohup ' + shQuote(dotnetPath) + ' ' + args + ' </dev/null >/dev/null 2>&1 &\n' +
+            '  echo $! > ' + shQuote(hwPidFile) + '\n' +
+            'fi';
+
+        if (streamNoConnectTimer) clearTimeout(streamNoConnectTimer);
+        streamNoConnectTimer = setTimeout(function () {
+            streamNoConnectTimer = null;
+            try {
+                if (!streamTcpSocket && streamProcRunning && gen === streamGeneration) {
+                    failoverHwToWayland('hw_connect_timeout');
+                }
+            } catch (e) {}
+        }, 5000);
+
+        try {
+            ctx.execute(wrapSh(startSh), 6000).then(function (r) {
+                if (!streamProcRunning || gen !== streamGeneration) {
+                    if (!streamProcRunning) ctx.execute(stopHwCmd(), 2000).catch(function () {});
+                    return;
+                }
+                if (r && r.exit_code !== 0) {
+                    failoverHwToWayland('hw_launch_exit_' + r.exit_code);
+                }
+            }, function () {
+                if (!streamProcRunning) {
+                    ctx.execute(stopHwCmd(), 2000).catch(function () {});
+                    return;
+                }
+                if (gen === streamGeneration) failoverHwToWayland('hw_launch_rejected');
+            });
+        } catch (e) {
+            failoverHwToWayland('hw_launch_sync_err');
         }
     }
 
@@ -830,75 +1336,117 @@ module.exports = function (ctx) {
         }
     }
 
+    function launchSelectedProducer(gen, port) {
+        if (!streamProcRunning || gen !== streamGeneration || streamClients.length === 0) return;
+        if (streamProducerType === 'hw') {
+            launchHwHelper(gen, port);
+        } else {
+            activeStreamBackend = 'wayland';
+            launchGst(gen, port);
+        }
+    }
+
     function startStreamPipeline() {
         if (streamProcRunning) return;
         streamProcRunning = true;
         var gen = ++streamGeneration;
-        if (streamServer && streamPort > 0) {
-            launchGst(gen, streamPort);
-            return;
-        }
-        var srv;
-        try {
-            srv = net.createServer(onStreamSocket);
-        } catch (e) {
-            stopStreamPipeline();
-            closeAllStreamClients();
-            return;
-        }
-        streamServer = srv;
-        srv.on('error', function () {
+
+        function startWithBackend(useHw) {
+            if (!streamProcRunning || gen !== streamGeneration || streamClients.length === 0) {
+                if (gen === streamGeneration) streamProcRunning = false;
+                return;
+            }
+            streamProducerType = useHw ? 'hw' : 'wayland';
+            activeStreamBackend = useHw ? 'hw' : 'wayland';
+            if (streamServer && streamPort > 0) {
+                launchSelectedProducer(gen, streamPort);
+                return;
+            }
+            var srv;
             try {
-                if (streamServer === srv) {
-                    stopStreamPipeline();
-                    closeAllStreamClients();
-                }
-            } catch (e) {}
-        });
-        try {
-            srv.listen(0, '127.0.0.1', function () {
+                srv = net.createServer(onStreamSocket);
+            } catch (e) {
+                stopStreamPipeline();
+                closeAllStreamClients();
+                return;
+            }
+            streamServer = srv;
+            srv.on('error', function () {
                 try {
-                    if (!streamProcRunning || gen !== streamGeneration || streamServer !== srv || streamClients.length === 0) {
-                        if (streamServer === srv) {
-                            streamServer = null;
-                            streamPort = 0;
-                            if (gen === streamGeneration) {
-                                streamProcRunning = false;
-                                if (streamKillTimer) {
-                                    clearTimeout(streamKillTimer);
-                                    streamKillTimer = null;
-                                }
-                            }
-                        }
-                        try { srv.close(); } catch (e) {}
-                        return;
-                    }
-                    var addr = srv.address();
-                    if (!addr || !addr.port) {
+                    if (streamServer === srv) {
                         stopStreamPipeline();
                         closeAllStreamClients();
-                        return;
                     }
-                    streamPort = addr.port;
-                    launchGst(gen, streamPort);
-                } catch (e) {
-                    stopStreamPipeline();
-                    closeAllStreamClients();
-                }
+                } catch (e) {}
             });
-        } catch (e) {
-            stopStreamPipeline();
-            closeAllStreamClients();
+            try {
+                srv.listen(0, '127.0.0.1', function () {
+                    try {
+                        if (!streamProcRunning || gen !== streamGeneration || streamServer !== srv || streamClients.length === 0) {
+                            if (streamServer === srv) {
+                                streamServer = null;
+                                streamPort = 0;
+                                if (gen === streamGeneration) {
+                                    streamProcRunning = false;
+                                    activeStreamBackend = 'idle';
+                                    if (streamKillTimer) {
+                                        clearTimeout(streamKillTimer);
+                                        streamKillTimer = null;
+                                    }
+                                }
+                            }
+                            try { srv.close(); } catch (e) {}
+                            return;
+                        }
+                        var addr = srv.address();
+                        if (!addr || !addr.port) {
+                            stopStreamPipeline();
+                            closeAllStreamClients();
+                            return;
+                        }
+                        streamPort = addr.port;
+                        launchSelectedProducer(gen, streamPort);
+                    } catch (e) {
+                        stopStreamPipeline();
+                        closeAllStreamClients();
+                    }
+                });
+            } catch (e) {
+                stopStreamPipeline();
+                closeAllStreamClients();
+            }
         }
+
+        if (captureMode === 'wayland' || hwFailedRuntime) {
+            startWithBackend(false);
+            return;
+        }
+        probeHardwareCapture(function (res) {
+            if (!streamProcRunning || gen !== streamGeneration || streamClients.length === 0) {
+                if (gen === streamGeneration) {
+                    streamProcRunning = false;
+                    activeStreamBackend = 'idle';
+                }
+                return;
+            }
+            startWithBackend(!!(res && res.hwAvailable && !hwFailedRuntime));
+        });
     }
 
-    function stopStreamPipeline() {
+    function stopStreamPipeline(preserveFrames) {
         var wasRunning = streamProcRunning;
+        var prevProducer = streamProducerType;
         streamProcRunning = false;
+        streamProducerType = null;
+        activeStreamBackend = 'idle';
         streamGeneration++;
         streamPipelineRestarts = 0;
-        lastFrame = null;
-        lastFrameTime = 0;
+        if (!preserveFrames) {
+            lastFrame = null;
+            lastFrameWidth = 0;
+            lastFrameHeight = 0;
+            lastFrameTime = 0;
+        }
         if (streamRestartTimer) {
             clearTimeout(streamRestartTimer);
             streamRestartTimer = null;
@@ -911,9 +1459,14 @@ module.exports = function (ctx) {
             clearTimeout(streamNoConnectTimer);
             streamNoConnectTimer = null;
         }
+        clearHwConnTimers(hwConnState);
+        hwConnState = null;
         if (streamTcpSocket) {
             var s = streamTcpSocket;
             streamTcpSocket = null;
+            if (prevProducer === 'hw') {
+                try { s.write('QUIT\n'); } catch (e) {}
+            }
             try { s.destroy(); } catch (e) {}
         }
         if (streamServer) {
@@ -923,9 +1476,12 @@ module.exports = function (ctx) {
             try { srv.close(); } catch (e) {}
         }
         if (wasRunning) {
-            try {
-                ctx.execute(STOP_STREAM_CMD, 2000).catch(function () {});
-            } catch (e) {}
+            if (prevProducer === 'hw' || !prevProducer) {
+                try { ctx.execute(stopHwCmd(), 2000).catch(function () {}); } catch (e) {}
+            }
+            if (prevProducer === 'wayland' || !prevProducer) {
+                try { ctx.execute(STOP_STREAM_CMD, 2000).catch(function () {}); } catch (e) {}
+            }
         }
     }
 
@@ -981,7 +1537,7 @@ module.exports = function (ctx) {
         });
     }
 
-    function runScreenshotCapture() {
+    function runWaylandScreenshotCapture() {
         var shotId = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
         var shotPath = '/tmp/shot_' + shotId + '.jpg';
         var shotFallbackPath = '/tmp/shot_' + shotId + '.png';
@@ -1020,6 +1576,62 @@ module.exports = function (ctx) {
         }, function () {
             unlinkFile(shotPath);
             fallbackDbus();
+        });
+    }
+
+    function runScreenshotCapture() {
+        if (captureMode === 'wayland' || hwFailedRuntime) {
+            runWaylandScreenshotCapture();
+            return;
+        }
+        if (streamProcRunning && streamProducerType === 'hw' && streamTcpSocket && hwConnState && hwConnState.ready) {
+            pumpHwLoop();
+            return;
+        }
+        probeHardwareCapture(function (res) {
+            if (!screenshotWaiters) return;
+            if (!res || !res.hwAvailable || hwFailedRuntime) {
+                runWaylandScreenshotCapture();
+                return;
+            }
+            var dll;
+            try {
+                dll = ensureHelperMaterialized();
+            } catch (err) {
+                runWaylandScreenshotCapture();
+                return;
+            }
+            var abi = res.hwAbi || ((process.arch === 'arm' || process.arch === 'ia32') ? 'ilp32' : 'lp64-int');
+            var shotOut = path.join(hwRuntimeDir, 'shot_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8) + '.jpg');
+            var cmd = 'DOTNET_ROLL_FORWARD=Major ' + shQuote(dotnetPath) + ' ' + shQuote(dll) +
+                ' --oneshot-hd --abi ' + abi + ' --quality 92 --out ' + shQuote(shotOut);
+            try {
+                ctx.execute(cmd, 8000).then(function (r) {
+                    if (!screenshotWaiters) {
+                        unlinkFile(shotOut);
+                        return;
+                    }
+                    if (r && r.exit_code === 0) {
+                        fs.stat(shotOut, function (err, stat) {
+                            if (!err && stat && stat.size > 1000) {
+                                readAndServeShot(shotOut, 'image/jpeg');
+                                return;
+                            }
+                            unlinkFile(shotOut);
+                            runWaylandScreenshotCapture();
+                        });
+                    } else {
+                        unlinkFile(shotOut);
+                        runWaylandScreenshotCapture();
+                    }
+                }, function () {
+                    unlinkFile(shotOut);
+                    runWaylandScreenshotCapture();
+                });
+            } catch (e) {
+                unlinkFile(shotOut);
+                runWaylandScreenshotCapture();
+            }
         });
     }
 
@@ -1143,7 +1755,8 @@ module.exports = function (ctx) {
                     ok: true,
                     paired: !!tok0.token,
                     tvIp: getTvIp(),
-                    stream: getStreamConfig()
+                    stream: getStreamConfig(),
+                    capture: getCaptureStatusSnapshot()
                 }));
                 return true;
             }
@@ -1458,7 +2071,60 @@ module.exports = function (ctx) {
                 return true;
             }
 
-            // GET api/stream — persistent low-latency MJPEG live stream with zero-backlog drop policy
+            // POST api/capture_mode — switch between automatic HW capture and forced Wayland capture
+            if (sub === 'capture_mode' && req.method === 'POST') {
+                readJson(req, 4096, function (err, parsed) {
+                    if (err) {
+                        res.writeHead(400, { 'content-type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: err.message }));
+                        return;
+                    }
+                    var nextMode = parsed && parsed.mode;
+                    if (nextMode !== 'auto' && nextMode !== 'wayland') {
+                        res.writeHead(400, { 'content-type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: 'invalid capture mode' }));
+                        return;
+                    }
+                    var prevMode = captureMode;
+                    captureMode = nextMode;
+                    if (captureMode === 'auto') {
+                        hwFailedRuntime = false;
+                        if (hwProbe.probed && !hwProbe.hwAvailable) {
+                            hwProbe.probed = false;
+                        }
+                    }
+                    try {
+                        var cfgCap = getCfg();
+                        cfgCap.captureMode = captureMode;
+                        saveCfg(cfgCap);
+                    } catch (e) {}
+
+                    if (prevMode !== captureMode) {
+                        lastFrame = null;
+                        lastFrameWidth = 0;
+                        lastFrameHeight = 0;
+                        lastFrameTime = 0;
+                        if (streamProcRunning) {
+                            if (streamClients.length > 0) {
+                                scheduleStreamRestart(true);
+                            } else {
+                                stopStreamPipeline(false);
+                            }
+                        }
+                    }
+                    res.writeHead(200, {
+                        'content-type': 'application/json',
+                        'cache-control': 'no-store'
+                    });
+                    res.end(JSON.stringify({
+                        ok: true,
+                        capture: getCaptureStatusSnapshot()
+                    }));
+                });
+                return true;
+            }
+
+            // GET api/stream — persistent low-latency MJPEG or length-prefixed binary live stream
             if (sub === 'stream' && req.method === 'GET') {
                 if (streamClients.length >= MAX_STREAM_CLIENTS) {
                     res.writeHead(503, {
@@ -1468,8 +2134,9 @@ module.exports = function (ctx) {
                     res.end(JSON.stringify({ ok: false, error: 'too many stream viewers' }));
                     return true;
                 }
+                var isBinFormat = /[?&]format=bin(?:&|$)/.test(String(req.url || ''));
                 res.writeHead(200, {
-                    'content-type': 'multipart/x-mixed-replace; boundary=--frame',
+                    'content-type': isBinFormat ? 'application/octet-stream' : 'multipart/x-mixed-replace; boundary=--frame',
                     'cache-control': 'no-cache, no-store, must-revalidate',
                     'pragma': 'no-cache',
                     'connection': 'close'
@@ -1477,6 +2144,7 @@ module.exports = function (ctx) {
                 if (res.socket && res.socket.setNoDelay) res.socket.setNoDelay(true);
                 var client = {
                     res: res,
+                    format: isBinFormat ? 'bin' : 'mjpeg',
                     busy: false,
                     lastSendTime: 0,
                     lastWriteOk: Date.now(),
@@ -1489,8 +2157,13 @@ module.exports = function (ctx) {
                 }
                 startStreamPipeline();
                 if (lastFrame && (Date.now() - lastFrameTime < 1500)) {
-                    var initHdr = asciiBuf('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + lastFrame.length + '\r\n\r\n');
-                    writeMjpegClient(client, Buffer.concat([initHdr, lastFrame, asciiBuf('\r\n')]));
+                    var initPacket = buildClientFramePacket(
+                        client.format,
+                        lastFrame,
+                        lastFrameWidth || streamWidth,
+                        lastFrameHeight || streamHeight
+                    );
+                    writeStreamClient(client, initPacket);
                 }
                 var onDisconnect = function () {
                     try {
