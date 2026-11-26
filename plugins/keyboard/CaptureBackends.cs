@@ -542,12 +542,64 @@ namespace VetroKeyboardHelper
 
         private IntPtr _outBuf;
         private uint _outBufCapacity;
+        private byte[] _yFullPlane = new byte[0];
         private byte[] _uPlane = new byte[0];
         private byte[] _vPlane = new byte[0];
         private byte[] _jpegScratch = new byte[0];
         private readonly int[] _strides = new int[3];
         private readonly IntPtr[] _planes = new IntPtr[3];
         private bool _disposed;
+
+        // Samsung libsec-video-capture outputs BT.709 studio/limited range (Y in [16..235], C in [16..240]); JFIF TurboJPEG expects BT.601 full [0..255].
+        internal static readonly byte[] LumaLimToFull = BuildLumaLimToFullLut();
+        internal static readonly byte[] ChromaLimToFull = BuildChromaLimToFullLut();
+        private const double ChromaLimToFullScale = 255.0 / 224.0;
+        private static readonly int[] Cb709ToY601Q8 = BuildLinearQ8Lut(0.101579 * ChromaLimToFullScale);
+        private static readonly int[] Cr709ToY601Q8 = BuildLinearQ8Lut(0.196076 * ChromaLimToFullScale);
+        private static readonly int[] Cb709ToCb601Q8 = BuildLinearQ8Lut(0.989854 * ChromaLimToFullScale);
+        private static readonly int[] Cr709ToCb601Q8 = BuildLinearQ8Lut(-0.110653 * ChromaLimToFullScale);
+        private static readonly int[] Cb709ToCr601Q8 = BuildLinearQ8Lut(-0.072452 * ChromaLimToFullScale);
+        private static readonly int[] Cr709ToCr601Q8 = BuildLinearQ8Lut(0.983398 * ChromaLimToFullScale);
+
+        private static int[] BuildLinearQ8Lut(double factor)
+        {
+            int[] lut = new int[256];
+            double scaled = factor * 256.0;
+            for (int i = 0; i < 256; i++)
+            {
+                lut[i] = (int)Math.Round(scaled * (i - 128));
+            }
+            return lut;
+        }
+
+        private static byte ClampByte(int v)
+        {
+            if (v <= 0) return 0;
+            if (v >= 255) return 255;
+            return (byte)v;
+        }
+
+        private static byte[] BuildLumaLimToFullLut()
+        {
+            byte[] lut = new byte[256];
+            for (int i = 0; i < 256; i++)
+            {
+                int v = (int)Math.Round((i - 16) * 255.0 / 219.0);
+                lut[i] = (byte)(v <= 0 ? 0 : (v >= 255 ? 255 : v));
+            }
+            return lut;
+        }
+
+        private static byte[] BuildChromaLimToFullLut()
+        {
+            byte[] lut = new byte[256];
+            for (int i = 0; i < 256; i++)
+            {
+                int v = (int)Math.Round(128.0 + (i - 128) * 255.0 / 224.0);
+                lut[i] = (byte)(v <= 0 ? 0 : (v >= 255 ? 255 : v));
+            }
+            return lut;
+        }
 
         private TurboJpegEncoder(
             IntPtr libHandle,
@@ -650,23 +702,117 @@ namespace VetroKeyboardHelper
             _outBufCapacity = cap;
         }
 
-        public static void DeinterleaveChroma(byte[] uvSrc, int uvLen, ChromaOrder order, byte[] uDst, byte[] vDst)
+        public static void DeinterleaveChroma(byte[] uvSrc, int uvLen, ChromaOrder order, byte[] uDst, byte[] vDst, bool expandLimitedRange = false)
         {
             int count = uvLen / 2;
+            byte[] cLut = expandLimitedRange ? ChromaLimToFull : null;
             if (order == ChromaOrder.Nv12)
             {
-                for (int i = 0, j = 0; j < count; i += 2, j++)
+                if (cLut != null)
                 {
-                    uDst[j] = uvSrc[i];
-                    vDst[j] = uvSrc[i + 1];
+                    for (int i = 0, j = 0; j < count; i += 2, j++)
+                    {
+                        uDst[j] = cLut[uvSrc[i]];
+                        vDst[j] = cLut[uvSrc[i + 1]];
+                    }
+                }
+                else
+                {
+                    for (int i = 0, j = 0; j < count; i += 2, j++)
+                    {
+                        uDst[j] = uvSrc[i];
+                        vDst[j] = uvSrc[i + 1];
+                    }
                 }
             }
             else
             {
-                for (int i = 0, j = 0; j < count; i += 2, j++)
+                if (cLut != null)
                 {
-                    vDst[j] = uvSrc[i];
-                    uDst[j] = uvSrc[i + 1];
+                    for (int i = 0, j = 0; j < count; i += 2, j++)
+                    {
+                        vDst[j] = cLut[uvSrc[i]];
+                        uDst[j] = cLut[uvSrc[i + 1]];
+                    }
+                }
+                else
+                {
+                    for (int i = 0, j = 0; j < count; i += 2, j++)
+                    {
+                        vDst[j] = uvSrc[i];
+                        uDst[j] = uvSrc[i + 1];
+                    }
+                }
+            }
+        }
+
+        public static void ConvertBt709LimitedToBt601Full(CapturedYuvFrame frame, byte[] yDst, byte[] uDst, byte[] vDst)
+        {
+            byte[] ySrc = frame.YPlane;
+            byte[] cSrc = frame.CPlane;
+            byte[] yLut = LumaLimToFull;
+            int[] cbToY = Cb709ToY601Q8;
+            int[] crToY = Cr709ToY601Q8;
+            int[] cbToCb = Cb709ToCb601Q8;
+            int[] crToCb = Cr709ToCb601Q8;
+            int[] cbToCr = Cb709ToCr601Q8;
+            int[] crToCr = Cr709ToCr601Q8;
+
+            bool isNv21 = (frame.ChromaOrder == ChromaOrder.Nv21);
+            bool is422 = (frame.Subsampling == CaptureSubsampling.Yuv422);
+            int yStride = frame.YStride;
+            int cStride = yStride / 2;
+            int cRowBytes = cStride * 2;
+            int cRows = is422 ? frame.Height : (frame.Height / 2);
+            int yLen = frame.YLength;
+            int cLen = frame.CLength;
+
+            for (int cy = 0; cy < cRows; cy++)
+            {
+                int cSrcRow = cy * cRowBytes;
+                int cDstRow = cy * cStride;
+                int yRow0 = (is422 ? cy : (cy * 2)) * yStride;
+                int yRow1 = is422 ? -1 : (yRow0 + yStride);
+
+                for (int cx = 0; cx < cStride; cx++)
+                {
+                    int uvIdx = cSrcRow + (cx * 2);
+                    if (uvIdx + 1 >= cLen) break;
+
+                    byte c0 = cSrc[uvIdx];
+                    byte c1 = cSrc[uvIdx + 1];
+                    byte uRaw = isNv21 ? c1 : c0;
+                    byte vRaw = isNv21 ? c0 : c1;
+
+                    uDst[cDstRow + cx] = ClampByte(128 + ((cbToCb[uRaw] + crToCb[vRaw] + 128) >> 8));
+                    vDst[cDstRow + cx] = ClampByte(128 + ((cbToCr[uRaw] + crToCr[vRaw] + 128) >> 8));
+
+                    int yDelta = (cbToY[uRaw] + crToY[vRaw] + 128) >> 8;
+                    int x0 = cx * 2;
+                    int idx0 = yRow0 + x0;
+                    if (idx0 + 1 < yLen)
+                    {
+                        yDst[idx0] = ClampByte(yLut[ySrc[idx0]] + yDelta);
+                        yDst[idx0 + 1] = ClampByte(yLut[ySrc[idx0 + 1]] + yDelta);
+                    }
+                    else if (idx0 < yLen)
+                    {
+                        yDst[idx0] = ClampByte(yLut[ySrc[idx0]] + yDelta);
+                    }
+
+                    if (!is422)
+                    {
+                        int idx1 = yRow1 + x0;
+                        if (idx1 + 1 < yLen)
+                        {
+                            yDst[idx1] = ClampByte(yLut[ySrc[idx1]] + yDelta);
+                            yDst[idx1 + 1] = ClampByte(yLut[ySrc[idx1 + 1]] + yDelta);
+                        }
+                        else if (idx1 < yLen)
+                        {
+                            yDst[idx1] = ClampByte(yLut[ySrc[idx1]] + yDelta);
+                        }
+                    }
                 }
             }
         }
@@ -680,10 +826,11 @@ namespace VetroKeyboardHelper
             int q = Clamp(quality, 20, 95);
             EnsureOutBuffer(frame.Width, frame.Height);
 
+            if (_yFullPlane.Length < frame.YLength) _yFullPlane = new byte[frame.YLength];
             int chromaLen = frame.CLength / 2;
             if (_uPlane.Length < chromaLen) _uPlane = new byte[chromaLen];
             if (_vPlane.Length < chromaLen) _vPlane = new byte[chromaLen];
-            DeinterleaveChroma(frame.CPlane, frame.CLength, frame.ChromaOrder, _uPlane, _vPlane);
+            ConvertBt709LimitedToBt601Full(frame, _yFullPlane, _uPlane, _vPlane);
 
             int cStride = frame.YStride / 2;
             _strides[0] = frame.YStride;
@@ -699,7 +846,7 @@ namespace VetroKeyboardHelper
             GCHandle hV = default(GCHandle);
             try
             {
-                hY = GCHandle.Alloc(frame.YPlane, GCHandleType.Pinned);
+                hY = GCHandle.Alloc(_yFullPlane, GCHandleType.Pinned);
                 hU = GCHandle.Alloc(_uPlane, GCHandleType.Pinned);
                 hV = GCHandle.Alloc(_vPlane, GCHandleType.Pinned);
                 _planes[0] = hY.AddrOfPinnedObject();

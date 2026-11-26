@@ -15,7 +15,7 @@ When `captureMode` is **`auto`** (the default):
   - The Node Shard (`plugins/keyboard/index.js`) extracts the tiny managed helper (`hardware-streamer.dll`, ~15 KB gzipped base64) into `ctx.dir/runtime/` (`0700` dir, `0600` files) and runs an isolated short-lived `--probe` child process.
   - If `--probe` succeeds, `index.js` starts `hardware-streamer.dll --serve` bound strictly to `127.0.0.1:<ephemeral>` (no extra LAN port).
   - Node sends pull-paced `CAP <w> <h> <q>\n` commands only when at least one viewer is ready to receive a frame (zero-backlog backpressure, 45 ms minimum interval thermal ceiling).
-  - The helper captures YUV via `ICaptureBackend`, encodes JPEG in native RAM using `libturbojpeg.so.0` (`tjCompressFromYUVPlanes`), and returns `[4B len][2B width][2B height][JPEG]`.
+  - The helper captures YUV via `ICaptureBackend`, converts Samsung's BT.709 studio/limited range (`Y ∈ [16..235]`, `C ∈ [16..240]`) to BT.601 full-range JFIF YCbCr (`[0..255]`) via fused Q8 LUTs (`ConvertBt709LimitedToBt601Full`) so blacks and colors match Wayland output, encodes JPEG in native RAM using `libturbojpeg.so.0` (`tjCompressFromYUVPlanes`), and returns `[4B len][2B width][2B height][JPEG]`.
   - Node broadcasts every frame simultaneously to both `?format=bin` `<canvas>` viewers and legacy `<img>` MJPEG viewers.
 - **HD Composite Screenshots (`GET api/screenshot`):**
   - Captures Wayland BGRA via `/usr/bin/gst-launch-1.0 ... ! fdsink fd=1` directly into stdout (zero `/tmp` raw files) and captures the HW YUV frame concurrently.
@@ -52,7 +52,7 @@ When `captureMode` is **`auto`** (the default):
 
 | TV / Platform | CPU / ABI | `.NET` Runtime | Status | Expected Behavior |
 | --- | --- | --- | --- | --- |
-| Samsung **UA50AU7000** (Novatek Kant-SU2, Tizen 6.0) | ARMv7 32-bit (`ilp32`) | .NET Core 3.1 | **Verified** | HW `secvideo` + `libturbojpeg` works (`720x576` YUV420 NV12 stretched to 16:9, ~18 FPS, <15% CPU) + 1080p composite HD screenshots |
+| Samsung **UA50AU7000** (Novatek Kant-SU2, Tizen 6.0) | ARMv7 32-bit (`ilp32`) | .NET Core 3.1 | **Verified** | HW `secvideo` + `libturbojpeg` works (`720x576` YUV420 NV12 with BT.709-to-BT.601 LUTs stretched to 16:9, ~18 FPS, <15% CPU) + 1080p composite HD screenshots |
 | Samsung Tizen **5 / 5.5** | ARMv7 32-bit | None (`/usr/bin/dotnet` absent) | Expected | Fast-fails `--probe` (`dotnet_missing`), automatically uses Wayland GStreamer |
 | Samsung Tizen **6.5 / 7 / 8 / 9+** (32-bit or `aarch64`) | `arm` (`ilp32`) / `arm64` (`lp64-int`, `lp64-sizet`) | .NET 6 / 8+ (`RollForward=Major`) | Needs TV test | Isolated `--probe` tests candidate ABIs safely; succeeds if ABI matches or falls back to Wayland cleanly |
 

@@ -65,8 +65,8 @@
         "exec"
       ],
       "url": "dist/keyboard-1.2.0.vplugin",
-      "sha256": "c955e6e64165ea26b5460790f083f02cb55f7705eecabbfd8d41887bc1805bff",
-      "size": 323337
+      "sha256": "b048c2b9b66a156bf56eff08547597deba669728a46a97068ea411e7673f4a6d",
+      "size": 334661
     },
     {
       "id": "notification-center",

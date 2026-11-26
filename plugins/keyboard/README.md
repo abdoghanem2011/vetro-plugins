@@ -76,7 +76,7 @@ Extracted helper files (`hardware-streamer.dll`, `.runtimeconfig.json`, `.deps.j
 
 The Screen Preview feature supports two capture layers:
 - **Auto Mode (Hardware Direct ASIC Capture + Wayland Composite):**
-  - **Live stream:** Uses Samsung's `libsec-video-capture.so.0` (`api_capture_screen`) + `libturbojpeg.so.0` via a pull-paced `.NET` helper (`hardware-streamer.dll`, source in [`CaptureBackends.cs`](./CaptureBackends.cs) & [`HardwareStreamer.cs`](./HardwareStreamer.cs)). Captures hardware-decoded broadcast TV, HDMI, and video playback directly alongside active overlays (~18 FPS on UA50AU7000, <15% CPU).
+  - **Live stream:** Uses Samsung's `libsec-video-capture.so.0` (`api_capture_screen`) + `libturbojpeg.so.0` via a pull-paced `.NET` helper (`hardware-streamer.dll`, source in [`CaptureBackends.cs`](./CaptureBackends.cs) & [`HardwareStreamer.cs`](./HardwareStreamer.cs)), converting BT.709 studio/limited-range YUV to BT.601 full-range JFIF for accurate blacks and colors (~18 FPS on UA50AU7000, <15% CPU).
   - **Single-shot 1080p capture:** Captures crisp `1920×1080` Wayland graphics over `fdsink` stdout (zero `/tmp` files) and alpha-composites UI/captions onto the hardware video frame.
   - **Automatic Fallback:** If `/usr/bin/dotnet` is missing (Tizen 5/5.5), native libraries/ABI differ, or a runtime error occurs, Vetro automatically falls back to Wayland GStreamer.
 - **Wayland Mode (Manual 1-Click Override):** Forces software Wayland compositor capture (`gst-launch-1.0 waylandsrc`). Useful on untested TVs if hardware capture produces swapped colors or wrong aspect ratios.

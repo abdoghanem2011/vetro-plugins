@@ -248,11 +248,13 @@ namespace VetroKeyboardHelper
 
                     int uVal = isNv21 ? c1Val : c0Val;
                     int vVal = isNv21 ? c0Val : c1Val;
+                    // BT.709 Studio/Limited Range to RGB (matches Samsung libsec-video-capture HD output)
+                    int cVal = 298 * (yVal - 16);
                     int d = uVal - 128;
                     int e = vVal - 128;
-                    int vr = ClampByte(yVal + ((359 * e + 128) >> 8));
-                    int vg = ClampByte(yVal - ((88 * d + 183 * e + 128) >> 8));
-                    int vb = ClampByte(yVal + ((454 * d + 128) >> 8));
+                    int vr = ClampByte((cVal + 459 * e + 128) >> 8);
+                    int vg = ClampByte((cVal - 55 * d - 136 * e + 128) >> 8);
+                    int vb = ClampByte((cVal + 541 * d + 128) >> 8);
 
                     if (a == 0)
                     {
@@ -647,14 +649,43 @@ namespace VetroKeyboardHelper
             Assert(!SecVideoCaptureBackend.TryComputeFrameGeometry(720, 576, 720 * 576, 720 * 576 / 2, 0, 0, 0, 0, true,
                 out aw, out ah, out ys, out yl, out cl, out sub), "reject zero dims when strict");
 
-            // 3. NV12 vs NV21 chroma deinterleave
+            // 3. NV12 vs NV21 chroma deinterleave + BT.601 Limited->Full LUTs
+            Assert(TurboJpegEncoder.LumaLimToFull[16] == 0 && TurboJpegEncoder.LumaLimToFull[235] == 255 && TurboJpegEncoder.LumaLimToFull[126] == 128, "LumaLimToFull LUT");
+            Assert(TurboJpegEncoder.ChromaLimToFull[16] == 0 && TurboJpegEncoder.ChromaLimToFull[128] == 128 && TurboJpegEncoder.ChromaLimToFull[240] == 255, "ChromaLimToFull LUT");
             byte[] uv = new byte[] { 10, 200, 20, 210 };
             byte[] u = new byte[2];
             byte[] v = new byte[2];
-            TurboJpegEncoder.DeinterleaveChroma(uv, 4, ChromaOrder.Nv12, u, v);
+            TurboJpegEncoder.DeinterleaveChroma(uv, 4, ChromaOrder.Nv12, u, v, false);
             Assert(u[0] == 10 && u[1] == 20 && v[0] == 200 && v[1] == 210, "NV12 deinterleave");
-            TurboJpegEncoder.DeinterleaveChroma(uv, 4, ChromaOrder.Nv21, u, v);
+            TurboJpegEncoder.DeinterleaveChroma(uv, 4, ChromaOrder.Nv21, u, v, false);
             Assert(u[0] == 200 && u[1] == 210 && v[0] == 10 && v[1] == 20, "NV21 deinterleave");
+            TurboJpegEncoder.DeinterleaveChroma(new byte[] { 16, 240 }, 2, ChromaOrder.Nv12, u, v, true);
+            Assert(u[0] == 0 && v[0] == 255, "NV12 limited->full expand");
+
+            // 3b. Fused BT.709 Limited -> BT.601 Full conversion (green, red, black, white)
+            CapturedYuvFrame convFrame = new CapturedYuvFrame();
+            convFrame.Width = 2;
+            convFrame.Height = 2;
+            convFrame.YStride = 2;
+            convFrame.YLength = 4;
+            convFrame.CLength = 2;
+            convFrame.Subsampling = CaptureSubsampling.Yuv420;
+            convFrame.ChromaOrder = ChromaOrder.Nv12;
+            convFrame.YPlane = new byte[] { 173, 173, 173, 173 };
+            convFrame.CPlane = new byte[] { 42, 26 };
+            byte[] cyDst = new byte[4];
+            byte[] cuDst = new byte[1];
+            byte[] cvDst = new byte[1];
+            TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
+            Assert(cyDst[0] >= 149 && cyDst[0] <= 152 && cuDst[0] >= 42 && cuDst[0] <= 46 && cvDst[0] >= 19 && cvDst[0] <= 23, "BT709->BT601 pure green");
+            convFrame.YPlane = new byte[] { 63, 63, 63, 63 };
+            convFrame.CPlane = new byte[] { 102, 240 };
+            TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
+            Assert(cyDst[0] >= 75 && cyDst[0] <= 78 && cuDst[0] >= 83 && cuDst[0] <= 87 && cvDst[0] >= 253, "BT709->BT601 pure red");
+            convFrame.YPlane = new byte[] { 16, 235, 16, 235 };
+            convFrame.CPlane = new byte[] { 128, 128 };
+            TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
+            Assert(cyDst[0] == 0 && cyDst[1] == 255 && cuDst[0] == 128 && cvDst[0] == 128, "BT709->BT601 black/white");
 
             // 4. 8-byte binary wire header roundtrip
             byte[] hdr = new byte[8];
@@ -662,7 +693,7 @@ namespace VetroKeyboardHelper
             Assert(hdr[0] == 0x00 && hdr[1] == 0x01 && hdr[2] == 0x02 && hdr[3] == 0x03, "header length");
             Assert(((hdr[4] << 8) | hdr[5]) == 1920 && ((hdr[6] << 8) | hdr[7]) == 1080, "header dims");
 
-            // 5. Alpha compositing BGRA over YUV (alpha=0 takes HW video, alpha=255 stays exact UI)
+            // 5. Alpha compositing BGRA over BT.709 limited-range YUV (Y=235 -> 255 full white, green -> ~0,255,0)
             CapturedYuvFrame hw = new CapturedYuvFrame();
             hw.Width = 4;
             hw.Height = 4;
@@ -675,14 +706,20 @@ namespace VetroKeyboardHelper
             hw.ChromaOrder = ChromaOrder.Nv12;
 
             byte[] bgra = new byte[4 * 4 * 4];
-            // Pixel 0: alpha=0 (video hole -> bright white ~235)
+            // Pixel 0: alpha=0 (video hole -> limited Y=235 expands to 255 pure white)
             bgra[0] = 0; bgra[1] = 0; bgra[2] = 0; bgra[3] = 0;
             // Pixel 1: alpha=255 (opaque red UI -> stays exact red)
             bgra[4] = 10; bgra[5] = 20; bgra[6] = 250; bgra[7] = 255;
             int blended = CompositeWaylandWithHardware(bgra, 4, 4, hw);
             Assert(blended == 15, "composite blended count");
-            Assert(bgra[0] == 235 && bgra[1] == 235 && bgra[2] == 235 && bgra[3] == 255, "transparent pixel shows video");
+            Assert(bgra[0] == 255 && bgra[1] == 255 && bgra[2] == 255 && bgra[3] == 255, "transparent pixel shows video");
             Assert(bgra[4] == 10 && bgra[5] == 20 && bgra[6] == 250 && bgra[7] == 255, "opaque pixel preserved");
+
+            for (int i = 0; i < 16; i++) hw.YPlane[i] = 173;
+            for (int i = 0; i < 8; i += 2) { hw.CPlane[i] = 42; hw.CPlane[i + 1] = 26; }
+            Array.Clear(bgra, 0, bgra.Length);
+            CompositeWaylandWithHardware(bgra, 4, 4, hw);
+            Assert(bgra[0] <= 2 && bgra[1] >= 253 && bgra[2] <= 2 && bgra[3] == 255, "BT709 composite pure green");
 
             Console.WriteLine("SELF_TEST_OK");
             return 0;
