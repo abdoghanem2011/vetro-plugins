@@ -545,6 +545,13 @@ module.exports = function (ctx) {
     }
 
     function ensureHelperMaterialized() {
+        if (hwMaterializedSha && fs.existsSync(hwDllPath)) {
+            var dllStat = fs.lstatSync(hwDllPath);
+            if (!dllStat.isSymbolicLink() && dllStat.isFile()) {
+                return hwDllPath;
+            }
+            hwMaterializedSha = null;
+        }
         var gzB64Path = path.join(__dirname, 'hardware-streamer.dll.gz.b64');
         var rcPath = path.join(__dirname, 'hardware-streamer.runtimeconfig.json');
         var depsPath = path.join(__dirname, 'hardware-streamer.deps.json');
@@ -581,12 +588,10 @@ module.exports = function (ctx) {
             }
         }
 
-        if (hwMaterializedSha !== expectedSha || !fs.existsSync(hwDllPath)) {
-            syncFile(hwDllPath, dllBytes, true);
-            syncFile(path.join(hwRuntimeDir, 'hardware-streamer.runtimeconfig.json'), fs.readFileSync(rcPath, 'utf8'), false);
-            syncFile(path.join(hwRuntimeDir, 'hardware-streamer.deps.json'), fs.readFileSync(depsPath, 'utf8'), false);
-            hwMaterializedSha = expectedSha;
-        }
+        syncFile(hwDllPath, dllBytes, true);
+        syncFile(path.join(hwRuntimeDir, 'hardware-streamer.runtimeconfig.json'), fs.readFileSync(rcPath, 'utf8'), false);
+        syncFile(path.join(hwRuntimeDir, 'hardware-streamer.deps.json'), fs.readFileSync(depsPath, 'utf8'), false);
+        hwMaterializedSha = expectedSha;
         return hwDllPath;
     }
 
@@ -1629,8 +1634,10 @@ module.exports = function (ctx) {
             runWaylandScreenshotCapture();
             return;
         }
-        if (streamProcRunning && streamProducerType === 'hw' && streamTcpSocket && hwConnState && hwConnState.ready) {
-            pumpHwLoop();
+        if (streamProcRunning && streamProducerType === 'hw') {
+            if (streamTcpSocket && hwConnState && hwConnState.ready) {
+                pumpHwLoop();
+            }
             return;
         }
         probeHardwareCapture(function (res) {
@@ -2131,6 +2138,7 @@ module.exports = function (ctx) {
                         return;
                     }
                     var prevMode = captureMode;
+                    var wasHwFailed = hwFailedRuntime;
                     captureMode = nextMode;
                     if (captureMode === 'auto') {
                         hwFailedRuntime = false;
@@ -2144,7 +2152,7 @@ module.exports = function (ctx) {
                         saveCfg(cfgCap);
                     } catch (e) {}
 
-                    if (prevMode !== captureMode) {
+                    if (prevMode !== captureMode || (captureMode === 'auto' && wasHwFailed)) {
                         lastFrame = null;
                         lastFrameWidth = 0;
                         lastFrameHeight = 0;

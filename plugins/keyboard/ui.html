@@ -3144,6 +3144,11 @@ var canvasPendingFrame = null;
 var fpsWindowCount = 0;
 var fpsWindowStart = 0;
 var currentLiveFps = 0;
+var lastLiveLabelText = "";
+var lastStreamFrameW = 0;
+var lastStreamFrameH = 0;
+var binFirstFrameReceived = false;
+var shotRequestId = 0;
 var supportsBinCanvas = !!(window.fetch && window.ReadableStream && window.createImageBitmap &&
   window.AbortController && screenCanvas && screenCanvas.getContext);
 var STREAM_PRESET_DEFAULTS = {
@@ -3177,7 +3182,7 @@ function refreshCaptureStatus() {
       if (d && d.capture) {
         updateCaptureUI(d.capture);
         if (chkAutoRefresh && chkAutoRefresh.checked && !streamFallbackPolling && currentLiveFps >= 0) {
-          formatLiveStreamLabel(currentStreamWidth, currentStreamHeight);
+          formatLiveStreamLabel(lastStreamFrameW || currentStreamWidth, lastStreamFrameH || currentStreamHeight);
         }
       }
     })
@@ -3191,13 +3196,17 @@ function getBackendBadgeText() {
   return (captureMode === "wayland") ? "Wayland" : "🔴 Live";
 }
 
+function setScreenTimeText(txt) {
+  if (!screenTime || txt === lastLiveLabelText) return;
+  lastLiveLabelText = txt;
+  screenTime.textContent = txt;
+}
+
 function formatLiveStreamLabel(w, h) {
   var badge = getBackendBadgeText();
   var fpsPart = currentLiveFps > 0 ? (" · " + currentLiveFps + " fps") : "";
   var dimPart = (w && h) ? (" · " + w + "×" + h) : "";
-  if (screenTime) {
-    screenTime.textContent = badge + fpsPart + dimPart + " · Q" + currentStreamQuality;
-  }
+  setScreenTimeText(badge + fpsPart + dimPart + " · Q" + currentStreamQuality);
 }
 
 function postCaptureMode(mode) {
@@ -3359,8 +3368,22 @@ function pumpCanvasDecode() {
   }
   window.createImageBitmap(item.blob).then(function (bmp) {
     try {
+      var srcW = item.w || bmp.width || 960;
+      var srcH = item.h || bmp.height || 540;
+      var targetW = Math.max(960, srcW);
+      var targetH = Math.round(targetW * 9 / 16);
+      if (screenCanvas.width !== targetW || screenCanvas.height !== targetH) {
+        screenCanvas.width = targetW;
+        screenCanvas.height = targetH;
+      }
       ctx2d.drawImage(bmp, 0, 0, screenCanvas.width, screenCanvas.height);
       streamFailCount = 0;
+      lastStreamFrameW = srcW;
+      lastStreamFrameH = srcH;
+      if (!binFirstFrameReceived) {
+        binFirstFrameReceived = true;
+        refreshCaptureStatus();
+      }
       var now = Date.now();
       if (!fpsWindowStart) fpsWindowStart = now;
       fpsWindowCount++;
@@ -3369,7 +3392,7 @@ function pumpCanvasDecode() {
         fpsWindowCount = 0;
         fpsWindowStart = now;
       }
-      formatLiveStreamLabel(item.w || bmp.width, item.h || bmp.height);
+      formatLiveStreamLabel(srcW, srcH);
     } finally {
       if (bmp && typeof bmp.close === "function") bmp.close();
       canvasDecodeBusy = false;
@@ -3386,6 +3409,9 @@ function startBinCanvasStream() {
   fpsWindowCount = 0;
   fpsWindowStart = Date.now();
   currentLiveFps = 0;
+  lastStreamFrameW = 0;
+  lastStreamFrameH = 0;
+  binFirstFrameReceived = false;
 
   var ctrl = new window.AbortController();
   binStreamAbort = ctrl;
@@ -3516,15 +3542,17 @@ function startImgMjpegStream() {
 }
 
 function startLiveStream() {
+  shotRequestId++;
   if (autoRefreshTimer) {
     clearTimeout(autoRefreshTimer);
     autoRefreshTimer = null;
   }
   screenCapturing = false;
   streamFallbackPolling = false;
+  lastLiveLabelText = "";
   btnRefreshScreen.disabled = false;
   btnRefreshScreen.textContent = "🔄 Reconnect";
-  screenTime.textContent = "Connecting live stream…";
+  setScreenTimeText("Connecting live stream…");
   if (supportsBinCanvas && !forceImgStreamFallback) {
     startBinCanvasStream();
   } else {
@@ -3534,6 +3562,7 @@ function startLiveStream() {
 }
 
 function stopLiveStream(keepSnapshot) {
+  shotRequestId++;
   if (autoRefreshTimer) {
     clearTimeout(autoRefreshTimer);
     autoRefreshTimer = null;
@@ -3542,6 +3571,9 @@ function stopLiveStream(keepSnapshot) {
   streamFailCount = 0;
   streamFallbackPolling = false;
   currentLiveFps = 0;
+  lastStreamFrameW = 0;
+  lastStreamFrameH = 0;
+  lastLiveLabelText = "";
   btnRefreshScreen.disabled = false;
   btnRefreshScreen.textContent = "🔄 Capture / Refresh";
   screenImg.onerror = null;
@@ -3554,7 +3586,7 @@ function stopLiveStream(keepSnapshot) {
     screenImg.style.display = "none";
     if (screenCanvas) screenCanvas.style.display = "none";
     if (screenFrame) screenFrame.classList.remove("has-image");
-    if (!keepSnapshot) screenTime.textContent = "";
+    if (!keepSnapshot) setScreenTimeText("");
   }
 }
 
@@ -3569,7 +3601,7 @@ document.addEventListener("visibilitychange", function () {
     screenImg.onerror = null;
     screenImg.onload = null;
     screenImg.src = "";
-    screenTime.textContent = "Stream paused (tab hidden)";
+    setScreenTimeText("Stream paused (tab hidden)");
   } else if (!boxScreen.classList.contains("is-collapsed") || isScreenOnly) {
     startLiveStream();
   }
@@ -3597,9 +3629,9 @@ function finishScreenshotSuccess(w, h) {
   var d = new Date();
   var pad = function (n) { return (n < 10 ? "0" : "") + n; };
   var resLabel = (w && h) ? (w + "×" + h + " ") : "";
-  screenTime.textContent = streamFallbackPolling
+  setScreenTimeText(streamFallbackPolling
     ? ("Live fallback · " + resLabel + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()))
-    : ("Captured " + resLabel + "at " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()));
+    : ("Captured " + resLabel + "at " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds())));
   if (isScreenOnly) fitScreenFrame();
 
   if (chkAutoRefresh && chkAutoRefresh.checked && streamFallbackPolling && (!boxScreen.classList.contains("is-collapsed") || isScreenOnly) && !document.hidden) {
@@ -3611,7 +3643,7 @@ function finishScreenshotError() {
   if (!hasScreenImage) {
     screenSpinner.textContent = "Failed to capture screen from TV";
   } else {
-    screenTime.textContent = "Refresh failed — retrying";
+    setScreenTimeText("Refresh failed — retrying");
   }
   screenCapturing = false;
   btnRefreshScreen.disabled = false;
@@ -3628,12 +3660,13 @@ function fetchScreenshot() {
     return;
   }
   if (screenCapturing) return;
+  var myShotId = ++shotRequestId;
   screenCapturing = true;
   if (!hasScreenImage) {
     screenSpinner.textContent = "Capturing 1080p screen from TV…";
     screenSpinner.style.display = "block";
   } else {
-    screenTime.textContent = streamFallbackPolling ? "Live fallback (polling)" : "Capturing 1080p…";
+    setScreenTimeText(streamFallbackPolling ? "Live fallback (polling)" : "Capturing 1080p…");
   }
   btnRefreshScreen.disabled = true;
   btnRefreshScreen.textContent = "⏳ Capturing…";
@@ -3644,10 +3677,15 @@ function fetchScreenshot() {
       if (!res || !res.ok) throw new Error("http_" + (res ? res.status : "err"));
       return res.blob();
     }).then(function (blob) {
+      if (myShotId !== shotRequestId) return;
       var blobUrl = URL.createObjectURL(blob);
       screenImg.onload = function () {
         screenImg.onload = null;
         screenImg.onerror = null;
+        if (myShotId !== shotRequestId) {
+          try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+          return;
+        }
         if (lastShotBlobUrl && lastShotBlobUrl !== blobUrl) {
           try { URL.revokeObjectURL(lastShotBlobUrl); } catch (e) {}
         }
@@ -3658,10 +3696,12 @@ function fetchScreenshot() {
         screenImg.onload = null;
         screenImg.onerror = null;
         try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+        if (myShotId !== shotRequestId) return;
         finishScreenshotError();
       };
       screenImg.src = blobUrl;
     }).catch(function () {
+      if (myShotId !== shotRequestId) return;
       finishScreenshotError();
     });
     return;
@@ -3669,12 +3709,14 @@ function fetchScreenshot() {
 
   var img = new Image();
   img.onload = function () {
+    if (myShotId !== shotRequestId) return;
     screenImg.onerror = null;
     screenImg.onload = null;
     screenImg.src = url;
     finishScreenshotSuccess(img.naturalWidth, img.naturalHeight);
   };
   img.onerror = function () {
+    if (myShotId !== shotRequestId) return;
     finishScreenshotError();
   };
   img.src = url;

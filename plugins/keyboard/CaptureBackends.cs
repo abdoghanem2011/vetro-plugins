@@ -552,7 +552,6 @@ namespace VetroKeyboardHelper
 
         // Samsung libsec-video-capture outputs BT.709 studio/limited range (Y in [16..235], C in [16..240]); JFIF TurboJPEG expects BT.601 full [0..255].
         internal static readonly byte[] LumaLimToFull = BuildLumaLimToFullLut();
-        internal static readonly byte[] ChromaLimToFull = BuildChromaLimToFullLut();
         private const double ChromaLimToFullScale = 255.0 / 224.0;
         private static readonly int[] Cb709ToY601Q8 = BuildLinearQ8Lut(0.101579 * ChromaLimToFullScale);
         private static readonly int[] Cr709ToY601Q8 = BuildLinearQ8Lut(0.196076 * ChromaLimToFullScale);
@@ -585,17 +584,6 @@ namespace VetroKeyboardHelper
             for (int i = 0; i < 256; i++)
             {
                 int v = (int)Math.Round((i - 16) * 255.0 / 219.0);
-                lut[i] = (byte)(v <= 0 ? 0 : (v >= 255 ? 255 : v));
-            }
-            return lut;
-        }
-
-        private static byte[] BuildChromaLimToFullLut()
-        {
-            byte[] lut = new byte[256];
-            for (int i = 0; i < 256; i++)
-            {
-                int v = (int)Math.Round(128.0 + (i - 128) * 255.0 / 224.0);
                 lut[i] = (byte)(v <= 0 ? 0 : (v >= 255 ? 255 : v));
             }
             return lut;
@@ -700,50 +688,6 @@ namespace VetroKeyboardHelper
             if (_outBuf != IntPtr.Zero) _tjFree(_outBuf);
             _outBuf = next;
             _outBufCapacity = cap;
-        }
-
-        public static void DeinterleaveChroma(byte[] uvSrc, int uvLen, ChromaOrder order, byte[] uDst, byte[] vDst, bool expandLimitedRange = false)
-        {
-            int count = uvLen / 2;
-            byte[] cLut = expandLimitedRange ? ChromaLimToFull : null;
-            if (order == ChromaOrder.Nv12)
-            {
-                if (cLut != null)
-                {
-                    for (int i = 0, j = 0; j < count; i += 2, j++)
-                    {
-                        uDst[j] = cLut[uvSrc[i]];
-                        vDst[j] = cLut[uvSrc[i + 1]];
-                    }
-                }
-                else
-                {
-                    for (int i = 0, j = 0; j < count; i += 2, j++)
-                    {
-                        uDst[j] = uvSrc[i];
-                        vDst[j] = uvSrc[i + 1];
-                    }
-                }
-            }
-            else
-            {
-                if (cLut != null)
-                {
-                    for (int i = 0, j = 0; j < count; i += 2, j++)
-                    {
-                        vDst[j] = cLut[uvSrc[i]];
-                        uDst[j] = cLut[uvSrc[i + 1]];
-                    }
-                }
-                else
-                {
-                    for (int i = 0, j = 0; j < count; i += 2, j++)
-                    {
-                        vDst[j] = uvSrc[i];
-                        uDst[j] = uvSrc[i + 1];
-                    }
-                }
-            }
         }
 
         public static void ConvertBt709LimitedToBt601Full(CapturedYuvFrame frame, byte[] yDst, byte[] uDst, byte[] vDst)

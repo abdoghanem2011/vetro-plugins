@@ -52,7 +52,7 @@ When `captureMode` is **`auto`** (the default):
 
 | TV / Platform | CPU / ABI | `.NET` Runtime | Status | Expected Behavior |
 | --- | --- | --- | --- | --- |
-| Samsung **UA50AU7000** (Novatek Kant-SU2, Tizen 6.0) | ARMv7 32-bit (`ilp32`) | .NET Core 3.1 | **Verified** | HW `secvideo` + `libturbojpeg` works (`720x576` YUV420 NV12 with BT.709-to-BT.601 LUTs stretched to 16:9, ~18 FPS, <15% CPU) + 1080p composite HD screenshots |
+| Samsung **UA50AU7000** (Novatek Kant-SU2, Tizen 6.0) | ARMv7 32-bit (`ilp32`) | .NET Core 3.1 | **Verified** | HW `secvideo` + `libturbojpeg` works (`720x576` YUV420 NV12 with BT.709-to-BT.601 LUTs stretched to 16:9, ~14–21 FPS, ~16–21% CPU above idle while streaming; helper exits when idle) + 1080p composite HD screenshots |
 | Samsung Tizen **5 / 5.5** | ARMv7 32-bit | None (`/usr/bin/dotnet` absent) | Expected | Fast-fails `--probe` (`dotnet_missing`), automatically uses Wayland GStreamer |
 | Samsung Tizen **6.5 / 7 / 8 / 9+** (32-bit or `aarch64`) | `arm` (`ilp32`) / `arm64` (`lp64-int`, `lp64-sizet`) | .NET 6 / 8+ (`RollForward=Major`) | Needs TV test | Isolated `--probe` tests candidate ABIs safely; succeeds if ABI matches or falls back to Wayland cleanly |
 

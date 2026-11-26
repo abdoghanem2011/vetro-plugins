@@ -796,3 +796,84 @@ test('GET api/screenshot during streamKillTimer grace window is not aborted mid-
     var st = await invokeRoute(h.plugin, { method: 'GET', sub: 'status' });
     assert.equal(st.json.capture.activeBackend, 'idle');
 });
+
+test('POST api/capture_mode {auto} retries HW after runtime failover and GET api/screenshot reuses connecting HW helper', async function (t) {
+    var hwStarts = 0;
+    var gstCount = 0;
+    var lastHwPort = 0;
+    var oneshotCalls = 0;
+    var hdShot = makeFakeJpeg(0xEE, 1920, 1080);
+    var h = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 0, stdout: '{"ok":true,"backend":"secvideo","abi":"ilp32"}', stderr: '' };
+            }
+            if (cmd.indexOf('--oneshot-hd') >= 0) {
+                oneshotCalls++;
+                return { exit_code: 1, stdout: '', stderr: 'should_not_spawn_oneshot' };
+            }
+            var plain = decodeWrapSh(cmd);
+            if (plain.indexOf('--serve --port ') >= 0) {
+                hwStarts++;
+                var pm = /--port (\d+)/.exec(plain);
+                lastHwPort = pm ? parseInt(pm[1], 10) : 0;
+            } else if (cmd.indexOf('gst-launch-1.0') >= 0) {
+                gstCount++;
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+
+    // Request GET api/screenshot while --serve is still connecting (before READY) -> must reuse --serve without spawning --oneshot-hd
+    var viewer = createStreamViewer(h.plugin, '/stream?format=bin');
+    await waitUntil(function () { return hwStarts === 1 && lastHwPort > 0; });
+    var shotPromise = invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
+
+    var sock1 = await connectProducer(lastHwPort);
+    t.after(function () { try { sock1.destroy(); } catch (e) {} });
+    var gotHdCmd = false;
+    var triggerFailover = false;
+    sock1.on('data', function (chunk) {
+        var txt = chunk.toString('ascii');
+        if (txt.indexOf('HD ') !== -1 && !gotHdCmd) {
+            gotHdCmd = true;
+            sock1.write(makeBinFrame(hdShot, 1920, 1080));
+        } else if (txt.indexOf('CAP ') !== -1) {
+            try {
+                sock1.write(triggerFailover ? Buffer.alloc(8) : makeBinFrame(makeFakeJpeg(0x11, 720, 576), 720, 576));
+            } catch (e) {}
+        }
+    });
+    sock1.write('READY secvideo ilp32\n');
+    var shotRes = await shotPromise;
+    assert.equal(shotRes.status, 200);
+    assert.deepEqual(shotRes.rawBuffer, hdShot);
+    assert.equal(oneshotCalls, 0, 'screenshot while --serve handshakes must not spawn concurrent --oneshot-hd');
+
+    // Trigger runtime failover (3 zero frames -> hwFailedRuntime = true, switches to Wayland)
+    triggerFailover = true;
+    await waitUntil(function () { return gstCount === 1; }, 3000);
+    var st = await invokeRoute(h.plugin, { method: 'GET', sub: 'status' });
+    assert.equal(st.json.capture.activeBackend, 'wayland');
+    assert.equal(st.json.capture.hwReason, 'hw_consecutive_errors');
+
+    // Clicking Auto while captureMode is already 'auto' (after runtime failover) must retry HW capture live
+    var retryRes = await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'auto' } });
+    assert.equal(retryRes.status, 200);
+    await waitUntil(function () { return hwStarts === 2; }, 3000);
+    var sock2 = await connectProducer(lastHwPort);
+    t.after(function () { try { sock2.destroy(); } catch (e) {} });
+    var sock2CapCount = 0;
+    sock2.on('data', function (chunk) {
+        if (chunk.toString('ascii').indexOf('CAP ') !== -1) {
+            sock2CapCount++;
+            try { sock2.write(makeBinFrame(makeFakeJpeg(0x22, 720, 576), 720, 576)); } catch (e) {}
+        }
+    });
+    sock2.write('READY secvideo ilp32\n');
+    await waitUntil(function () { return sock2CapCount >= 1; }, 3000);
+    var st2 = await invokeRoute(h.plugin, { method: 'GET', sub: 'status' });
+    assert.equal(st2.json.capture.activeBackend, 'hw');
+    assert.equal(viewer.isEnded(), false);
+});

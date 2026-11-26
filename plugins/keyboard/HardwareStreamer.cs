@@ -277,11 +277,18 @@ namespace VetroKeyboardHelper
             return blendedCount;
         }
 
+        private static byte[] _hdBgraBuf;
+
         private static bool TryReadWaylandBgraStdout(out byte[] bgra)
         {
             int expectedBytes = HdWidth * HdHeight * 4;
-            bgra = new byte[expectedBytes];
+            if (_hdBgraBuf == null || _hdBgraBuf.Length != expectedBytes)
+            {
+                _hdBgraBuf = new byte[expectedBytes];
+            }
+            bgra = _hdBgraBuf;
             Process gstProc = null;
+            Timer killTimer = null;
             try
             {
                 ProcessStartInfo psi = new ProcessStartInfo
@@ -297,6 +304,11 @@ namespace VetroKeyboardHelper
                 psi.Environment["XDG_RUNTIME_DIR"] = "/run";
                 gstProc = Process.Start(psi);
                 if (gstProc == null) return false;
+                Process startedProc = gstProc;
+                killTimer = new Timer(delegate(object state)
+                {
+                    try { if (!startedProc.HasExited) startedProc.Kill(); } catch { }
+                }, null, 4000, Timeout.Infinite);
                 gstProc.BeginErrorReadLine();
 
                 Stream stdout = gstProc.StandardOutput.BaseStream;
@@ -329,6 +341,7 @@ namespace VetroKeyboardHelper
             }
             finally
             {
+                if (killTimer != null) killTimer.Dispose();
                 if (gstProc != null) gstProc.Dispose();
             }
         }
@@ -507,6 +520,8 @@ namespace VetroKeyboardHelper
             }
         }
 
+        private static readonly char[] SpaceSep = new char[] { ' ' };
+
         private static int RunServe(int port, int timeoutSec, StructAbi abi, ChromaOrder chroma)
         {
             if (port < 1 || port > 65535) return FailJson("Missing valid --port");
@@ -556,7 +571,7 @@ namespace VetroKeyboardHelper
 
                     if (line.StartsWith("CAP ", StringComparison.Ordinal))
                     {
-                        string[] parts = line.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                        string[] parts = line.Split(SpaceSep, StringSplitOptions.RemoveEmptyEntries);
                         int reqW = (parts.Length >= 2) ? ParseClamped(parts[1], 64, 1920, 720) : 720;
                         int reqH = (parts.Length >= 3) ? ParseClamped(parts[2], 64, 1080, 576) : 576;
                         int q = (parts.Length >= 4) ? ParseClamped(parts[3], 20, 95, 55) : 55;
@@ -588,7 +603,7 @@ namespace VetroKeyboardHelper
                     }
                     else if (line.StartsWith("HD", StringComparison.Ordinal))
                     {
-                        string[] parts = line.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                        string[] parts = line.Split(SpaceSep, StringSplitOptions.RemoveEmptyEntries);
                         int q = (parts.Length >= 2) ? ParseClamped(parts[1], 20, 95, 92) : 92;
 
                         byte[] jpeg;
@@ -652,20 +667,9 @@ namespace VetroKeyboardHelper
             Assert(!SecVideoCaptureBackend.TryComputeFrameGeometry(720, 576, 720 * 576, 720 * 576 / 2, 0, 0, 0, 0, true,
                 out aw, out ah, out ys, out yl, out cl, out sub), "reject zero dims when strict");
 
-            // 3. NV12 vs NV21 chroma deinterleave + BT.601 Limited->Full LUTs
+            // 3. BT.709 Limited -> BT.601 Full conversion (NV12/NV21, YUV420/YUV422: green, red, black, white)
             Assert(TurboJpegEncoder.LumaLimToFull[16] == 0 && TurboJpegEncoder.LumaLimToFull[235] == 255 && TurboJpegEncoder.LumaLimToFull[126] == 128, "LumaLimToFull LUT");
-            Assert(TurboJpegEncoder.ChromaLimToFull[16] == 0 && TurboJpegEncoder.ChromaLimToFull[128] == 128 && TurboJpegEncoder.ChromaLimToFull[240] == 255, "ChromaLimToFull LUT");
-            byte[] uv = new byte[] { 10, 200, 20, 210 };
-            byte[] u = new byte[2];
-            byte[] v = new byte[2];
-            TurboJpegEncoder.DeinterleaveChroma(uv, 4, ChromaOrder.Nv12, u, v, false);
-            Assert(u[0] == 10 && u[1] == 20 && v[0] == 200 && v[1] == 210, "NV12 deinterleave");
-            TurboJpegEncoder.DeinterleaveChroma(uv, 4, ChromaOrder.Nv21, u, v, false);
-            Assert(u[0] == 200 && u[1] == 210 && v[0] == 10 && v[1] == 20, "NV21 deinterleave");
-            TurboJpegEncoder.DeinterleaveChroma(new byte[] { 16, 240 }, 2, ChromaOrder.Nv12, u, v, true);
-            Assert(u[0] == 0 && v[0] == 255, "NV12 limited->full expand");
 
-            // 3b. Fused BT.709 Limited -> BT.601 Full conversion (green, red, black, white)
             CapturedYuvFrame convFrame = new CapturedYuvFrame();
             convFrame.Width = 2;
             convFrame.Height = 2;
@@ -677,14 +681,26 @@ namespace VetroKeyboardHelper
             convFrame.YPlane = new byte[] { 173, 173, 173, 173 };
             convFrame.CPlane = new byte[] { 42, 26 };
             byte[] cyDst = new byte[4];
-            byte[] cuDst = new byte[1];
-            byte[] cvDst = new byte[1];
+            byte[] cuDst = new byte[2];
+            byte[] cvDst = new byte[2];
             TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
-            Assert(cyDst[0] >= 149 && cyDst[0] <= 152 && cuDst[0] >= 42 && cuDst[0] <= 46 && cvDst[0] >= 19 && cvDst[0] <= 23, "BT709->BT601 pure green");
+            Assert(cyDst[0] >= 149 && cyDst[0] <= 152 && cuDst[0] >= 42 && cuDst[0] <= 46 && cvDst[0] >= 19 && cvDst[0] <= 23, "BT709->BT601 NV12 420 green");
+
+            convFrame.ChromaOrder = ChromaOrder.Nv21;
+            convFrame.CPlane = new byte[] { 26, 42 };
+            TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
+            Assert(cyDst[0] >= 149 && cyDst[0] <= 152 && cuDst[0] >= 42 && cuDst[0] <= 46 && cvDst[0] >= 19 && cvDst[0] <= 23, "BT709->BT601 NV21 420 green");
+
+            convFrame.Subsampling = CaptureSubsampling.Yuv422;
+            convFrame.ChromaOrder = ChromaOrder.Nv12;
+            convFrame.CLength = 4;
             convFrame.YPlane = new byte[] { 63, 63, 63, 63 };
-            convFrame.CPlane = new byte[] { 102, 240 };
+            convFrame.CPlane = new byte[] { 102, 240, 102, 240 };
             TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
-            Assert(cyDst[0] >= 75 && cyDst[0] <= 78 && cuDst[0] >= 83 && cuDst[0] <= 87 && cvDst[0] >= 253, "BT709->BT601 pure red");
+            Assert(cyDst[0] >= 75 && cyDst[0] <= 78 && cyDst[2] == cyDst[0] && cuDst[1] >= 83 && cuDst[1] <= 87 && cvDst[1] >= 253, "BT709->BT601 422 red");
+
+            convFrame.Subsampling = CaptureSubsampling.Yuv420;
+            convFrame.CLength = 2;
             convFrame.YPlane = new byte[] { 16, 235, 16, 235 };
             convFrame.CPlane = new byte[] { 128, 128 };
             TurboJpegEncoder.ConvertBt709LimitedToBt601Full(convFrame, cyDst, cuDst, cvDst);
