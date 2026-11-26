@@ -132,10 +132,11 @@ function invokeRoute(plugin, opts) {
                 this.finished = true;
                 var fl = listeners.finish.slice();
                 for (var fi = 0; fi < fl.length; fi++) fl[fi]();
-                var raw = Buffer.concat(chunks).toString('utf8');
+                var fullBuf = Buffer.concat(chunks);
+                var raw = fullBuf.toString('utf8');
                 var json = null;
                 try { json = JSON.parse(raw); } catch (e) {}
-                resolve({ handled: true, status: statusCode, headers: resHeaders, body: raw, json: json });
+                resolve({ handled: true, status: statusCode, headers: resHeaders, body: raw, rawBuffer: fullBuf, json: json });
             }
         };
 
@@ -729,4 +730,69 @@ test('POST api/capture_mode validates, persists, and switches live backend betwe
     assert.equal(swAuto.json.capture.mode, 'auto');
     assert.equal(h.getConfig().captureMode, 'auto');
     await waitUntil(function () { return hwCount === 2; });
+});
+
+test('GET api/screenshot during streamKillTimer grace window is not aborted mid-shot and tears down helper afterward', async function (t) {
+    var hwPort = 0;
+    var stopCmds = 0;
+    var hdShot = makeFakeJpeg(0xDD, 1920, 1080);
+    var hwSock = null;
+    var h = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 0, stdout: '{"ok":true,"backend":"secvideo","abi":"ilp32"}', stderr: '' };
+            }
+            var plain = decodeWrapSh(cmd);
+            if (plain.indexOf('--serve --port ') >= 0) {
+                var pm = /--port (\d+)/.exec(plain);
+                hwPort = pm ? parseInt(pm[1], 10) : 0;
+            } else if (plain.indexOf('systemctl stop') >= 0) {
+                stopCmds++;
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+
+    var viewer = createStreamViewer(h.plugin, '/stream?format=bin');
+    await waitUntil(function () { return hwPort > 0; });
+    hwSock = await connectProducer(hwPort);
+    t.after(function () { try { hwSock.destroy(); } catch (e) {} });
+
+    var rxBuf = '';
+    var capCount = 0;
+    hwSock.on('data', function (chunk) {
+        rxBuf += chunk.toString('ascii');
+        var nl;
+        while ((nl = rxBuf.indexOf('\n')) !== -1) {
+            var line = rxBuf.slice(0, nl).trim();
+            rxBuf = rxBuf.slice(nl + 1);
+            if (line.indexOf('CAP ') === 0) {
+                capCount++;
+                hwSock.write(makeBinFrame(makeFakeJpeg(0x11, 720, 576), 720, 576));
+            } else if (line.indexOf('HD ') === 0) {
+                // Simulate a 2.3s composite capture (>2.0s streamKillTimer grace window)
+                setTimeout(function () {
+                    try { hwSock.write(makeBinFrame(hdShot, 1920, 1080)); } catch (e) {}
+                }, 2300);
+            }
+        }
+    });
+    hwSock.write('READY secvideo ilp32\n');
+    await waitUntil(function () { return capCount >= 1; });
+
+    // Disconnect sole viewer and immediately request a single-shot screenshot (stopLiveStream(true) flow)
+    viewer.disconnect();
+    var shotPromise = invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
+
+    var shotRes = await shotPromise;
+    assert.equal(shotRes.status, 200);
+    assert.equal(shotRes.headers['content-type'], 'image/jpeg');
+    assert.deepEqual(shotRes.rawBuffer, hdShot);
+    assert.equal(stopCmds, 0, 'helper must not be stopped while HD screenshot is still in flight');
+
+    // After screenshot completes with zero viewers, the 2s idle grace timer must still stop the helper
+    await waitUntil(function () { return stopCmds >= 1; }, 4000);
+    var st = await invokeRoute(h.plugin, { method: 'GET', sub: 'status' });
+    assert.equal(st.json.capture.activeBackend, 'idle');
 });

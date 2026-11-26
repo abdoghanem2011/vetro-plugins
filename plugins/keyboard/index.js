@@ -901,7 +901,7 @@ module.exports = function (ctx) {
             streamKillTimer = setTimeout(function () {
                 streamKillTimer = null;
                 try {
-                    if (streamClients.length === 0) {
+                    if (streamClients.length === 0 && !(screenshotWaiters && screenshotWaiters.length > 0)) {
                         stopStreamPipeline();
                     }
                 } catch (e) {}
@@ -1055,7 +1055,7 @@ module.exports = function (ctx) {
                         st.paceTimer = null;
                         pumpHwLoop();
                     }
-                }, 80);
+                }, 15);
             }
             return;
         }
@@ -1085,24 +1085,44 @@ module.exports = function (ctx) {
             inFlightTimer: null,
             paceTimer: null,
             consecutiveErrors: 0,
-            buf: allocBuf(0)
+            chunks: [],
+            totalBytes: 0,
+            expectedLen: -1,
+            expectedW: 0,
+            expectedH: 0
         };
         hwConnState = st;
+
+        function flattenSt() {
+            var buf = (st.chunks.length === 1) ? st.chunks[0] : Buffer.concat(st.chunks, st.totalBytes);
+            st.chunks = [buf];
+            st.totalBytes = buf.length;
+            return buf;
+        }
+
+        function consumeSt(n) {
+            var buf = flattenSt();
+            var rem = (buf.length > n) ? buf.slice(n) : null;
+            st.chunks = rem ? [rem] : [];
+            st.totalBytes = rem ? rem.length : 0;
+        }
 
         return function (chunk) {
             try {
                 if (hwConnState !== st || gen !== streamGeneration || !chunk || chunk.length === 0) return;
-                st.buf = Buffer.concat([st.buf, chunk]);
-                if (st.buf.length > 16777216) {
+                st.chunks.push(chunk);
+                st.totalBytes += chunk.length;
+                if (st.totalBytes > 16777216) {
                     failoverHwToWayland('hw_frame_overflow');
                     return;
                 }
 
                 if (!st.ready) {
-                    var nl = st.buf.indexOf(10); // '\n'
+                    var readyBuf = flattenSt();
+                    var nl = readyBuf.indexOf(10); // '\n'
                     if (nl === -1) return;
-                    var line = st.buf.slice(0, nl).toString('ascii').trim();
-                    st.buf = st.buf.slice(nl + 1);
+                    var line = readyBuf.slice(0, nl).toString('ascii').trim();
+                    consumeSt(nl + 1);
                     if (line.indexOf('READY ') !== 0) {
                         failoverHwToWayland('hw_bad_handshake');
                         return;
@@ -1112,18 +1132,28 @@ module.exports = function (ctx) {
                     pumpHwLoop();
                 }
 
-                while (st.inFlight && st.buf.length >= 8) {
-                    var frameLen = st.buf.readUInt32BE(0);
-                    var fw = st.buf.readUInt16BE(4);
-                    var fh = st.buf.readUInt16BE(6);
-                    if (frameLen > 16777216) {
-                        failoverHwToWayland('hw_frame_too_large');
-                        return;
+                while (st.inFlight) {
+                    if (st.expectedLen < 0) {
+                        if (st.totalBytes < 8) break;
+                        var hdrBuf = flattenSt();
+                        st.expectedLen = hdrBuf.readUInt32BE(0);
+                        st.expectedW = hdrBuf.readUInt16BE(4);
+                        st.expectedH = hdrBuf.readUInt16BE(6);
+                        if (st.expectedLen > 16777216) {
+                            failoverHwToWayland('hw_frame_too_large');
+                            return;
+                        }
                     }
-                    if (st.buf.length < 8 + frameLen) break;
+                    if (st.totalBytes < 8 + st.expectedLen) break;
 
-                    var jpeg = st.buf.slice(8, 8 + frameLen);
-                    st.buf = st.buf.slice(8 + frameLen);
+                    var fullBuf = flattenSt();
+                    var frameLen = st.expectedLen;
+                    var fw = st.expectedW;
+                    var fh = st.expectedH;
+                    var jpeg = fullBuf.slice(8, 8 + frameLen);
+                    consumeSt(8 + frameLen);
+                    st.expectedLen = -1;
+
                     var kind = st.inFlight;
                     st.inFlight = null;
                     if (st.inFlightTimer) {
@@ -1199,6 +1229,7 @@ module.exports = function (ctx) {
                         try { sock.destroy(); } catch (e) {}
                         return;
                     }
+                    var hadPendingHd = !!(hwConnState && hwConnState.inFlight === 'hd');
                     streamTcpSocket = null;
                     clearHwConnTimers(hwConnState);
                     hwConnState = null;
@@ -1206,6 +1237,7 @@ module.exports = function (ctx) {
                     if (streamClients.length > 0 && streamProcRunning && !streamRestartTimer && connGen === streamGeneration) {
                         if (streamProducerType === 'hw' && captureMode === 'auto') {
                             failoverHwToWayland('hw_helper_disconnected');
+                            return;
                         } else if (streamPipelineRestarts < 1) {
                             streamPipelineRestarts++;
                             streamProcRunning = false;
@@ -1214,6 +1246,9 @@ module.exports = function (ctx) {
                             stopStreamPipeline();
                             closeAllStreamClients();
                         }
+                    }
+                    if (hadPendingHd && screenshotWaiters && screenshotWaiters.length > 0) {
+                        runWaylandScreenshotCapture();
                     }
                 } catch (e) {}
             };
@@ -1436,6 +1471,7 @@ module.exports = function (ctx) {
     function stopStreamPipeline(preserveFrames) {
         var wasRunning = streamProcRunning;
         var prevProducer = streamProducerType;
+        var hadPendingHd = !!(hwConnState && hwConnState.inFlight === 'hd');
         streamProcRunning = false;
         streamProducerType = null;
         activeStreamBackend = 'idle';
@@ -1483,6 +1519,9 @@ module.exports = function (ctx) {
                 try { ctx.execute(STOP_STREAM_CMD, 2000).catch(function () {}); } catch (e) {}
             }
         }
+        if (hadPendingHd && screenshotWaiters && screenshotWaiters.length > 0) {
+            runWaylandScreenshotCapture();
+        }
     }
 
     function takeShotWaiters() {
@@ -1505,6 +1544,9 @@ module.exports = function (ctx) {
                 r.end(data);
             } catch (e) {}
         }
+        if (streamClients.length === 0 && streamProcRunning) {
+            checkAllClientsClosed();
+        }
     }
 
     function finishShotErr(msg) {
@@ -1517,6 +1559,9 @@ module.exports = function (ctx) {
                 r.writeHead(500, { 'content-type': 'application/json' });
                 r.end(body);
             } catch (e) {}
+        }
+        if (streamClients.length === 0 && streamProcRunning) {
+            checkAllClientsClosed();
         }
     }
 
@@ -1724,8 +1769,8 @@ module.exports = function (ctx) {
             stopMouseHold(true);
             invalidateMouseNodeCache();
             closeAllStreamClients();
-            stopStreamPipeline();
             clearScreenshotWaiters();
+            stopStreamPipeline();
             page = null;
         },
 
@@ -2165,11 +2210,17 @@ module.exports = function (ctx) {
                     );
                     writeStreamClient(client, initPacket);
                 }
+                var onDrain = function () {
+                    if (!client.closed && streamProducerType === 'hw' && hwConnState && hwConnState.ready && !hwConnState.inFlight) {
+                        pumpHwLoop();
+                    }
+                };
                 var onDisconnect = function () {
                     try {
                         removeStreamClient(client);
                     } catch (e) {}
                 };
+                res.on('drain', onDrain);
                 req.on('close', onDisconnect);
                 req.on('error', onDisconnect);
                 res.on('close', onDisconnect);

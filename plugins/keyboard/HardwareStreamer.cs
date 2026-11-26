@@ -533,7 +533,7 @@ namespace VetroKeyboardHelper
 
                 StreamReader reader = new StreamReader(netStream, Encoding.ASCII);
                 CapturedYuvFrame hwFrame = new CapturedYuvFrame();
-                byte[] header8 = new byte[8];
+                byte[] sendBuf = new byte[256 * 1024];
                 byte[] zeroHeader = new byte[8];
                 Stopwatch paceWatch = Stopwatch.StartNew();
                 long lastCapMs = -MinFrameIntervalMs;
@@ -566,21 +566,22 @@ namespace VetroKeyboardHelper
                         {
                             Thread.Sleep((int)(MinFrameIntervalMs - elapsed));
                         }
+                        lastCapMs = paceWatch.ElapsedMilliseconds;
 
                         byte[] jpeg;
                         int jpegLen;
                         string capErr;
                         if (backend.TryCapture(reqW, reqH, ref hwFrame, out capErr) &&
-                            encoder.TryEncodeYuv(hwFrame, q, out jpeg, out jpegLen))
+                            encoder.TryEncodeYuv(hwFrame, q, out jpeg, out jpegLen) && jpegLen > 0)
                         {
-                            lastCapMs = paceWatch.ElapsedMilliseconds;
-                            WriteBinaryFrameHeader(header8, jpegLen, hwFrame.Width, hwFrame.Height);
-                            netStream.Write(header8, 0, 8);
-                            netStream.Write(jpeg, 0, jpegLen);
+                            int total = 8 + jpegLen;
+                            if (sendBuf.Length < total) sendBuf = new byte[total];
+                            WriteBinaryFrameHeader(sendBuf, jpegLen, hwFrame.Width, hwFrame.Height);
+                            Buffer.BlockCopy(jpeg, 0, sendBuf, 8, jpegLen);
+                            netStream.Write(sendBuf, 0, total);
                         }
                         else
                         {
-                            lastCapMs = paceWatch.ElapsedMilliseconds;
                             netStream.Write(zeroHeader, 0, 8);
                         }
                         netStream.Flush();
@@ -592,11 +593,13 @@ namespace VetroKeyboardHelper
 
                         byte[] jpeg;
                         int jpegLen, outW, outH;
-                        if (TryCaptureHdComposite(backend, encoder, q, ref hwFrame, out jpeg, out jpegLen, out outW, out outH))
+                        if (TryCaptureHdComposite(backend, encoder, q, ref hwFrame, out jpeg, out jpegLen, out outW, out outH) && jpegLen > 0)
                         {
-                            WriteBinaryFrameHeader(header8, jpegLen, outW, outH);
-                            netStream.Write(header8, 0, 8);
-                            netStream.Write(jpeg, 0, jpegLen);
+                            int total = 8 + jpegLen;
+                            if (sendBuf.Length < total) sendBuf = new byte[total];
+                            WriteBinaryFrameHeader(sendBuf, jpegLen, outW, outH);
+                            Buffer.BlockCopy(jpeg, 0, sendBuf, 8, jpegLen);
+                            netStream.Write(sendBuf, 0, total);
                         }
                         else
                         {
