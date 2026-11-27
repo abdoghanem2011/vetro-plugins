@@ -39,8 +39,8 @@ When `captureMode` is **`auto`** (the default):
 - Browser decodes via `fetch()` + `res.body.getReader()` + `createImageBitmap()` → `<canvas>` (dropping stale frames while a decode is in flight and calling `bitmap.close()` immediately to prevent GPU memory leaks). Older browsers fall back automatically to `<img src="stream">` MJPEG.
 
 ### B. Helper Loopback Protocol (`127.0.0.1:<ephemeral>`)
-1. Helper connects to Node's ephemeral TCP server and writes one ASCII line:
-   `READY <backend> <abi>\n` (e.g., `READY secvideo ilp32\n`).
+1. Helper connects to Node's ephemeral TCP server and writes one ASCII handshake line:
+   `READY <token> <backend> <abi>\n` using the per-launch `VETRO_STREAM_TOKEN` environment variable (or `READY <backend> <abi>\n` when invoked manually without `VETRO_STREAM_TOKEN`). Unauthenticated or duplicate connections are rejected by Node.
 2. Node sends single-line commands:
    - `CAP <width> <height> <quality>\n` → Helper replies `[4B len][2B w][2B h][JPEG]` (or 8 zero bytes `0x00*8` on transient failure).
    - `HD <quality>\n` → Helper captures 1080p Wayland-over-HW composite JPEG and replies `[4B len][2B w][2B h][JPEG]` (or `0x00*8` on failure).

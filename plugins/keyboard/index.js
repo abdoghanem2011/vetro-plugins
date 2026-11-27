@@ -481,7 +481,7 @@ module.exports = function (ctx) {
     var hwRuntimeDir = path.join(ctx.dir || __dirname, 'runtime');
     var hwDllPath = path.join(hwRuntimeDir, 'hardware-streamer.dll');
     var hwPidFile = path.join(hwRuntimeDir, 'hw.pid');
-    var hwMaterializedSha = null;
+    var hwExpectedCache = null;
     var captureMode = 'auto';
     var hwFailedRuntime = false;
     var activeStreamBackend = 'idle';
@@ -501,6 +501,8 @@ module.exports = function (ctx) {
     var streamServer = null;
     var streamPort = 0;
     var streamTcpSocket = null;
+    var hwSessionToken = null;
+    var hwAuthSockets = [];
     var hwConnState = null;
     var lastFrame = null;
     var lastFrameWidth = 0;
@@ -545,16 +547,20 @@ module.exports = function (ctx) {
     }
 
     function ensureHelperMaterialized() {
-        if (hwMaterializedSha && fs.existsSync(hwDllPath)) {
-            var dllStat = fs.lstatSync(hwDllPath);
-            if (!dllStat.isSymbolicLink() && dllStat.isFile()) {
-                return hwDllPath;
-            }
-            hwMaterializedSha = null;
+        if (!hwExpectedCache) {
+            var gzB64Path = path.join(__dirname, 'hardware-streamer.dll.gz.b64');
+            var rcPath = path.join(__dirname, 'hardware-streamer.runtimeconfig.json');
+            var depsPath = path.join(__dirname, 'hardware-streamer.deps.json');
+            var encoded = fs.readFileSync(gzB64Path, 'utf8').trim();
+            var compressed = (typeof Buffer.from === 'function') ? Buffer.from(encoded, 'base64') : new Buffer(encoded, 'base64');
+            var dllBytes = zlib.gunzipSync(compressed);
+            hwExpectedCache = {
+                dllBytes: dllBytes,
+                dllSha: crypto.createHash('sha256').update(dllBytes).digest('hex'),
+                rcText: fs.readFileSync(rcPath, 'utf8'),
+                depsText: fs.readFileSync(depsPath, 'utf8')
+            };
         }
-        var gzB64Path = path.join(__dirname, 'hardware-streamer.dll.gz.b64');
-        var rcPath = path.join(__dirname, 'hardware-streamer.runtimeconfig.json');
-        var depsPath = path.join(__dirname, 'hardware-streamer.deps.json');
         if (!fs.existsSync(hwRuntimeDir)) {
             fs.mkdirSync(hwRuntimeDir, 448); // 0700 owned by Vetro UID
         }
@@ -562,10 +568,7 @@ module.exports = function (ctx) {
         if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
             throw new Error('Unsafe runtime directory');
         }
-        var encoded = fs.readFileSync(gzB64Path, 'utf8').trim();
-        var compressed = (typeof Buffer.from === 'function') ? Buffer.from(encoded, 'base64') : new Buffer(encoded, 'base64');
-        var dllBytes = zlib.gunzipSync(compressed);
-        var expectedSha = crypto.createHash('sha256').update(dllBytes).digest('hex');
+        var expectedSha = hwExpectedCache.dllSha;
 
         function syncFile(targetPath, bufOrText, checkSha) {
             var needsWrite = true;
@@ -582,16 +585,15 @@ module.exports = function (ctx) {
                 }
             }
             if (needsWrite) {
-                var tmpPath = targetPath + '.new';
-                fs.writeFileSync(tmpPath, bufOrText, { mode: 384 }); // 0600
+                var tmpPath = targetPath + '.' + crypto.randomBytes(6).toString('hex') + '.new';
+                fs.writeFileSync(tmpPath, bufOrText, { mode: 384, flag: 'wx' }); // 0600, O_EXCL
                 fs.renameSync(tmpPath, targetPath);
             }
         }
 
-        syncFile(hwDllPath, dllBytes, true);
-        syncFile(path.join(hwRuntimeDir, 'hardware-streamer.runtimeconfig.json'), fs.readFileSync(rcPath, 'utf8'), false);
-        syncFile(path.join(hwRuntimeDir, 'hardware-streamer.deps.json'), fs.readFileSync(depsPath, 'utf8'), false);
-        hwMaterializedSha = expectedSha;
+        syncFile(hwDllPath, hwExpectedCache.dllBytes, true);
+        syncFile(path.join(hwRuntimeDir, 'hardware-streamer.runtimeconfig.json'), hwExpectedCache.rcText, false);
+        syncFile(path.join(hwRuntimeDir, 'hardware-streamer.deps.json'), hwExpectedCache.depsText, false);
         return hwDllPath;
     }
 
@@ -1082,10 +1084,20 @@ module.exports = function (ctx) {
         }
     }
 
-    function createHwSocketHandler(sock, gen) {
+    function tokensMatch(expected, actual) {
+        if (typeof expected !== 'string' || typeof actual !== 'string') return false;
+        if (expected.length === 0 || expected.length !== actual.length) return false;
+        var diff = 0;
+        for (var i = 0; i < expected.length; i++) {
+            diff |= (expected.charCodeAt(i) ^ actual.charCodeAt(i));
+        }
+        return diff === 0;
+    }
+
+    function createHwSocketHandler(sock, gen, preAuthed) {
         var st = {
             gen: gen,
-            ready: false,
+            ready: !!preAuthed,
             inFlight: null,
             inFlightTimer: null,
             paceTimer: null,
@@ -1192,6 +1204,29 @@ module.exports = function (ctx) {
         };
     }
 
+    function removeAuthSocket(entry) {
+        if (!entry) return;
+        if (entry.timer) {
+            clearTimeout(entry.timer);
+            entry.timer = null;
+        }
+        var idx = hwAuthSockets.indexOf(entry);
+        if (idx !== -1) hwAuthSockets.splice(idx, 1);
+    }
+
+    function clearAuthSockets() {
+        var list = hwAuthSockets.slice();
+        hwAuthSockets = [];
+        for (var i = 0; i < list.length; i++) {
+            var e = list[i];
+            if (e.timer) {
+                clearTimeout(e.timer);
+                e.timer = null;
+            }
+            try { if (e.sock) e.sock.destroy(); } catch (err) {}
+        }
+    }
+
     function onStreamSocket(sock) {
         try {
             var remote = sock.remoteAddress ? String(sock.remoteAddress).replace(/^::ffff:/i, '') : '';
@@ -1199,67 +1234,138 @@ module.exports = function (ctx) {
                 try { sock.destroy(); } catch (e) {}
                 return;
             }
-            if (!streamProcRunning || streamClients.length === 0) {
+            if (!streamProcRunning || streamClients.length === 0 || streamTcpSocket) {
                 try { sock.destroy(); } catch (e) {}
                 return;
             }
-            if (streamTcpSocket) {
-                var prev = streamTcpSocket;
-                streamTcpSocket = null;
-                clearHwConnTimers(hwConnState);
-                hwConnState = null;
-                try { prev.destroy(); } catch (e) {}
-            }
-            streamTcpSocket = sock;
-            if (streamNoConnectTimer) {
-                clearTimeout(streamNoConnectTimer);
-                streamNoConnectTimer = null;
-            }
-            streamPipelineRestarts = 0;
             if (sock.setNoDelay) sock.setNoDelay(true);
 
             var connGen = streamGeneration;
-            if (streamProducerType === 'hw') {
-                sock.on('data', createHwSocketHandler(sock, connGen));
-            } else {
-                activeStreamBackend = 'wayland';
-                sock.on('data', createJpegParser(function (frame) {
-                    broadcastFrame(frame, 0, 0);
-                }));
+
+            function attachActiveSocket(dataHandler) {
+                streamTcpSocket = sock;
+                if (streamNoConnectTimer) {
+                    clearTimeout(streamNoConnectTimer);
+                    streamNoConnectTimer = null;
+                }
+                streamPipelineRestarts = 0;
+                sock.on('data', dataHandler);
+
+                var handleDisconnect = function () {
+                    try {
+                        if (streamTcpSocket !== sock) {
+                            try { sock.destroy(); } catch (e) {}
+                            return;
+                        }
+                        var hadPendingHd = !!(hwConnState && hwConnState.inFlight === 'hd');
+                        streamTcpSocket = null;
+                        clearHwConnTimers(hwConnState);
+                        hwConnState = null;
+                        try { sock.destroy(); } catch (e) {}
+                        if (streamClients.length > 0 && streamProcRunning && !streamRestartTimer && connGen === streamGeneration) {
+                            if (streamProducerType === 'hw' && captureMode === 'auto') {
+                                failoverHwToWayland('hw_helper_disconnected');
+                                return;
+                            } else if (streamPipelineRestarts < 1) {
+                                streamPipelineRestarts++;
+                                streamProcRunning = false;
+                                startStreamPipeline();
+                            } else {
+                                stopStreamPipeline();
+                                closeAllStreamClients();
+                            }
+                        }
+                        if (hadPendingHd && screenshotWaiters && screenshotWaiters.length > 0) {
+                            runWaylandScreenshotCapture();
+                        }
+                    } catch (e) {}
+                };
+
+                sock.on('error', handleDisconnect);
+                sock.on('close', handleDisconnect);
             }
 
-            var handleDisconnect = function () {
+            if (streamProducerType !== 'hw') {
+                attachActiveSocket(createJpegParser(function (frame) {
+                    broadcastFrame(frame, 0, 0);
+                }));
+                activeStreamBackend = 'wayland';
+                return;
+            }
+
+            // Require per-launch token in READY handshake before replacing/committing streamTcpSocket
+            var expectedTok = hwSessionToken;
+            var authChunks = [];
+            var authBytes = 0;
+            var authEntry = { sock: sock, timer: null };
+            hwAuthSockets.push(authEntry);
+
+            function rejectAuth() {
+                removeAuthSocket(authEntry);
+                sock.removeListener('data', onAuthData);
+                sock.removeListener('error', onAuthEnd);
+                sock.removeListener('close', onAuthEnd);
+                try { sock.destroy(); } catch (e) {}
+            }
+
+            function onAuthEnd() {
+                rejectAuth();
+            }
+
+            authEntry.timer = setTimeout(function () {
+                rejectAuth();
+            }, 1500);
+
+            function onAuthData(chunk) {
                 try {
-                    if (streamTcpSocket !== sock) {
-                        try { sock.destroy(); } catch (e) {}
+                    if (!chunk || chunk.length === 0) return;
+                    if (!streamProcRunning || connGen !== streamGeneration || streamTcpSocket || streamClients.length === 0) {
+                        rejectAuth();
                         return;
                     }
-                    var hadPendingHd = !!(hwConnState && hwConnState.inFlight === 'hd');
-                    streamTcpSocket = null;
-                    clearHwConnTimers(hwConnState);
-                    hwConnState = null;
-                    try { sock.destroy(); } catch (e) {}
-                    if (streamClients.length > 0 && streamProcRunning && !streamRestartTimer && connGen === streamGeneration) {
-                        if (streamProducerType === 'hw' && captureMode === 'auto') {
-                            failoverHwToWayland('hw_helper_disconnected');
-                            return;
-                        } else if (streamPipelineRestarts < 1) {
-                            streamPipelineRestarts++;
-                            streamProcRunning = false;
-                            startStreamPipeline();
-                        } else {
-                            stopStreamPipeline();
-                            closeAllStreamClients();
-                        }
+                    authChunks.push(chunk);
+                    authBytes += chunk.length;
+                    if (authBytes > 512) {
+                        rejectAuth();
+                        return;
                     }
-                    if (hadPendingHd && screenshotWaiters && screenshotWaiters.length > 0) {
-                        runWaylandScreenshotCapture();
-                    }
-                } catch (e) {}
-            };
+                    var buf = (authChunks.length === 1) ? authChunks[0] : Buffer.concat(authChunks, authBytes);
+                    var nl = buf.indexOf(10);
+                    if (nl === -1) return;
 
-            sock.on('error', handleDisconnect);
-            sock.on('close', handleDisconnect);
+                    var line = buf.slice(0, nl).toString('ascii').replace(/\r/g, '').trim();
+                    if (line.indexOf('READY ') !== 0) {
+                        rejectAuth();
+                        return;
+                    }
+                    var parts = line.slice(6).replace(/^\s+|\s+$/g, '').split(/\s+/);
+                    if (!expectedTok || parts.length < 3 || !tokensMatch(expectedTok, parts[0])) {
+                        rejectAuth();
+                        return;
+                    }
+
+                    // Handshake authenticated: promote socket to active HW producer
+                    removeAuthSocket(authEntry);
+                    sock.removeListener('data', onAuthData);
+                    sock.removeListener('error', onAuthEnd);
+                    sock.removeListener('close', onAuthEnd);
+
+                    var leftover = (nl + 1 < buf.length) ? buf.slice(nl + 1) : null;
+                    var handler = createHwSocketHandler(sock, connGen, true);
+                    attachActiveSocket(handler);
+                    activeStreamBackend = 'hw';
+                    if (leftover && leftover.length > 0) {
+                        handler(leftover);
+                    }
+                    pumpHwLoop();
+                } catch (e) {
+                    rejectAuth();
+                }
+            }
+
+            sock.on('data', onAuthData);
+            sock.on('error', onAuthEnd);
+            sock.on('close', onAuthEnd);
         } catch (e) {
             try { sock.destroy(); } catch (e2) {}
         }
@@ -1275,6 +1381,8 @@ module.exports = function (ctx) {
             failoverHwToWayland('materialize_failed');
             return;
         }
+        var tok = crypto.randomBytes(16).toString('hex');
+        hwSessionToken = tok;
         var args = shQuote(dll) + ' --serve --port ' + port + ' --abi ' + abi + ' --timeout 60';
         var startSh =
             'systemctl stop --no-block ' + shQuote(hwUnit + '.service') + ' >/dev/null 2>&1 || true\n' +
@@ -1284,11 +1392,12 @@ module.exports = function (ctx) {
             'if command -v systemd-run >/dev/null 2>&1; then\n' +
             '  systemd-run --unit=' + shQuote(hwUnit) + ' --collect ' +
             '-p Environment=DOTNET_ROLL_FORWARD=Major ' +
+            '-p Environment=VETRO_STREAM_TOKEN=' + tok + ' ' +
             '-p StandardOutput=null -p StandardError=null ' +
             shQuote(dotnetPath) + ' ' + args + ' </dev/null >/dev/null 2>&1 && launched=1\n' +
             'fi\n' +
             'if [ "$launched" -eq 0 ]; then\n' +
-            '  DOTNET_ROLL_FORWARD=Major setsid nohup ' + shQuote(dotnetPath) + ' ' + args + ' </dev/null >/dev/null 2>&1 &\n' +
+            '  DOTNET_ROLL_FORWARD=Major VETRO_STREAM_TOKEN=' + tok + ' setsid nohup ' + shQuote(dotnetPath) + ' ' + args + ' </dev/null >/dev/null 2>&1 &\n' +
             '  echo $! > ' + shQuote(hwPidFile) + '\n' +
             'fi';
 
@@ -1502,6 +1611,8 @@ module.exports = function (ctx) {
         }
         clearHwConnTimers(hwConnState);
         hwConnState = null;
+        hwSessionToken = null;
+        clearAuthSockets();
         if (streamTcpSocket) {
             var s = streamTcpSocket;
             streamTcpSocket = null;
@@ -1577,18 +1688,25 @@ module.exports = function (ctx) {
     }
 
     function readAndServeShot(filePath, contentType) {
-        fs.readFile(filePath, function (err, data) {
-            unlinkFile(filePath);
-            if (err) {
-                finishShotErr(err.message);
+        fs.lstat(filePath, function (statErr, stat) {
+            if (statErr || !stat || stat.isSymbolicLink() || !stat.isFile()) {
+                if (!statErr && stat && stat.isSymbolicLink()) unlinkFile(filePath);
+                finishShotErr(statErr ? statErr.message : 'Unsafe screenshot file');
                 return;
             }
-            finishShotOk(contentType, data);
+            fs.readFile(filePath, function (err, data) {
+                unlinkFile(filePath);
+                if (err) {
+                    finishShotErr(err.message);
+                    return;
+                }
+                finishShotOk(contentType, data);
+            });
         });
     }
 
     function runWaylandScreenshotCapture() {
-        var shotId = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+        var shotId = crypto.randomBytes(12).toString('hex');
         var shotPath = '/tmp/shot_' + shotId + '.jpg';
         var shotFallbackPath = '/tmp/shot_' + shotId + '.png';
         var gstCmd = "WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run gst-launch-1.0 -q waylandsrc num-buffers=1 ! video/x-raw,width=1920,height=1080 ! videoconvert ! jpegenc quality=85 ! filesink location='" + shotPath + "'";
@@ -1654,7 +1772,7 @@ module.exports = function (ctx) {
                 return;
             }
             var abi = res.hwAbi || ((process.arch === 'arm' || process.arch === 'ia32') ? 'ilp32' : 'lp64-int');
-            var shotOut = path.join(hwRuntimeDir, 'shot_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8) + '.jpg');
+            var shotOut = path.join(hwRuntimeDir, 'shot_' + crypto.randomBytes(12).toString('hex') + '.jpg');
             var cmd = 'DOTNET_ROLL_FORWARD=Major ' + shQuote(dotnetPath) + ' ' + shQuote(dll) +
                 ' --oneshot-hd --abi ' + abi + ' --quality 92 --out ' + shQuote(shotOut);
             try {

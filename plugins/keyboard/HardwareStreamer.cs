@@ -485,6 +485,51 @@ namespace VetroKeyboardHelper
             }
         }
 
+        internal static bool TryWriteNewFileAtomic(string outPath, byte[] data, int length, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(outPath))
+            {
+                error = "missing_out_path";
+                return false;
+            }
+            if (File.Exists(outPath))
+            {
+                error = "output_exists";
+                return false;
+            }
+            string tmpOut = outPath + ".new";
+            bool createdTmp = false;
+            try
+            {
+                // CreateNew maps to O_CREAT | O_EXCL on Linux, refusing pre-existing files and symlinks
+                using (FileStream fs = new FileStream(tmpOut, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    createdTmp = true;
+                    fs.Write(data, 0, length);
+                }
+                File.Move(tmpOut, outPath);
+                createdTmp = false;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "write_failed:" + ex.Message;
+                return false;
+            }
+            finally
+            {
+                if (createdTmp)
+                {
+                    try
+                    {
+                        if (File.Exists(tmpOut)) File.Delete(tmpOut);
+                    }
+                    catch { }
+                }
+            }
+        }
+
         private static int RunOneshotHd(string outPath, int quality, StructAbi abi, ChromaOrder chroma)
         {
             if (string.IsNullOrEmpty(outPath)) return FailJson("Missing --out");
@@ -504,12 +549,11 @@ namespace VetroKeyboardHelper
                     return FailJson("oneshot_hd_failed");
                 }
 
-                string tmpOut = outPath + ".new";
-                using (FileStream fs = new FileStream(tmpOut, FileMode.Create, FileAccess.Write, FileShare.None))
+                string writeErr;
+                if (!TryWriteNewFileAtomic(outPath, jpeg, jpegLen, out writeErr))
                 {
-                    fs.Write(jpeg, 0, jpegLen);
+                    return FailJson(writeErr ?? "oneshot_write_failed");
                 }
-                File.Move(tmpOut, outPath, true);
                 Console.WriteLine("{\"ok\":true,\"width\":" + outW + ",\"height\":" + outH + ",\"bytes\":" + jpegLen + "}");
                 return 0;
             }
@@ -541,8 +585,25 @@ namespace VetroKeyboardHelper
                 client.ReceiveTimeout = timeoutSec * 1000;
                 client.SendTimeout = 5000;
 
+                string rawToken = Environment.GetEnvironmentVariable("VETRO_STREAM_TOKEN");
+                string streamToken = string.IsNullOrEmpty(rawToken) ? null : rawToken.Trim();
+                if (!string.IsNullOrEmpty(streamToken))
+                {
+                    for (int ti = 0; ti < streamToken.Length; ti++)
+                    {
+                        char c = streamToken[ti];
+                        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '-'))
+                        {
+                            return FailJson("invalid_stream_token");
+                        }
+                    }
+                }
+
                 NetworkStream netStream = client.GetStream();
-                byte[] readyBytes = Encoding.ASCII.GetBytes("READY " + backend.Name + " " + backend.AbiName + "\n");
+                string readyLine = string.IsNullOrEmpty(streamToken)
+                    ? ("READY " + backend.Name + " " + backend.AbiName + "\n")
+                    : ("READY " + streamToken + " " + backend.Name + " " + backend.AbiName + "\n");
+                byte[] readyBytes = Encoding.ASCII.GetBytes(readyLine);
                 netStream.Write(readyBytes, 0, readyBytes.Length);
                 netStream.Flush();
 
@@ -739,6 +800,26 @@ namespace VetroKeyboardHelper
             Array.Clear(bgra, 0, bgra.Length);
             CompositeWaylandWithHardware(bgra, 4, 4, hw);
             Assert(bgra[0] <= 2 && bgra[1] >= 253 && bgra[2] <= 2 && bgra[3] == 255, "BT709 composite pure green");
+
+            // 6. Exclusive atomic file creation refuses pre-existing target and .new files
+            string testDir = Path.Combine(Path.GetTempPath(), "vetro-hs-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(testDir);
+            try
+            {
+                string target = Path.Combine(testDir, "shot.jpg");
+                byte[] sample = new byte[] { 0xFF, 0xD8, 0xFF, 0xD9 };
+                string wErr;
+                Assert(TryWriteNewFileAtomic(target, sample, sample.Length, out wErr) && File.Exists(target), "atomic create succeeds");
+                Assert(!TryWriteNewFileAtomic(target, sample, sample.Length, out wErr), "atomic create refuses existing target");
+
+                string target2 = Path.Combine(testDir, "shot2.jpg");
+                File.WriteAllBytes(target2 + ".new", sample);
+                Assert(!TryWriteNewFileAtomic(target2, sample, sample.Length, out wErr), "atomic create refuses existing .new");
+            }
+            finally
+            {
+                try { Directory.Delete(testDir, true); } catch { }
+            }
 
             Console.WriteLine("SELF_TEST_OK");
             return 0;

@@ -484,6 +484,12 @@ function decodeWrapSh(cmd) {
     return m ? Buffer.from(m[1], 'base64').toString('utf8') : cmd;
 }
 
+function extractHwToken(cmd) {
+    var plain = decodeWrapSh(cmd);
+    var m = /VETRO_STREAM_TOKEN=([0-9a-f]+)/.exec(plain || '');
+    return m ? m[1] : '';
+}
+
 function makeFakeJpeg(tagByte, w, h) {
     // Minimal valid JPEG with SOF0 header carrying (w, h)
     var b = Buffer.alloc(20);
@@ -511,6 +517,7 @@ test('hardware helper serves dual bin/mjpeg viewers, hot-swaps CAP quality, serv
     var hwLaunches = 0;
     var hwStops = 0;
     var hwPort = 0;
+    var hwToken = '';
     var hwSock = null;
     var hwCmds = [];
     var jpegFrameA = makeFakeJpeg(0xAA, 720, 576);
@@ -532,6 +539,7 @@ test('hardware helper serves dual bin/mjpeg viewers, hot-swaps CAP quality, serv
                 hwLaunches++;
                 var pm = /--port (\d+)/.exec(plain);
                 hwPort = pm ? parseInt(pm[1], 10) : 0;
+                hwToken = extractHwToken(cmd);
                 return { exit_code: 0, stdout: '', stderr: '' };
             }
             if (plain.indexOf('systemctl stop') >= 0) {
@@ -547,7 +555,7 @@ test('hardware helper serves dual bin/mjpeg viewers, hot-swaps CAP quality, serv
     assert.equal(vBin.getHeaders()['content-type'], 'application/octet-stream');
     assert.equal(vMjpeg.getHeaders()['content-type'], 'multipart/x-mixed-replace; boundary=--frame');
 
-    await waitUntil(function () { return hwPort > 0; });
+    await waitUntil(function () { return hwPort > 0 && hwToken.length === 32; });
     assert.equal(fs.existsSync(path.join(h.files.root, 'runtime', 'hardware-streamer.dll')), true);
 
     hwSock = await connectProducer(hwPort);
@@ -572,7 +580,7 @@ test('hardware helper serves dual bin/mjpeg viewers, hot-swaps CAP quality, serv
         }
     });
 
-    hwSock.write('READY secvideo ilp32\n');
+    hwSock.write('READY ' + hwToken + ' secvideo ilp32\n');
     await waitUntil(function () {
         return vBin.getData().indexOf(jpegFrameA) >= 0 && vMjpeg.getData().indexOf(jpegFrameA) >= 0;
     });
@@ -645,6 +653,7 @@ test('falls back cleanly to Wayland on --probe SIGSEGV and mid-stream consecutiv
     // Subcase B: --probe succeeds, then HW returns 3 zero-length frames -> auto-failover to Wayland without dropping viewer
     var sub2Gst = [];
     var sub2HwPort = 0;
+    var sub2HwToken = '';
     var hFailover = createPluginHarness(t, {
         dotnetExists: true,
         onExecute: function (cmd) {
@@ -655,6 +664,7 @@ test('falls back cleanly to Wayland on --probe SIGSEGV and mid-stream consecutiv
             if (plain.indexOf('--serve --port ') >= 0) {
                 var pm = /--port (\d+)/.exec(plain);
                 sub2HwPort = pm ? parseInt(pm[1], 10) : 0;
+                sub2HwToken = extractHwToken(cmd);
                 return { exit_code: 0, stdout: '', stderr: '' };
             }
             if (cmd.indexOf('gst-launch-1.0') >= 0) {
@@ -665,7 +675,7 @@ test('falls back cleanly to Wayland on --probe SIGSEGV and mid-stream consecutiv
     });
 
     var vFail = createStreamViewer(hFailover.plugin, '/stream?format=bin');
-    await waitUntil(function () { return sub2HwPort > 0; });
+    await waitUntil(function () { return sub2HwPort > 0 && sub2HwToken.length > 0; });
     var hwSock2 = await connectProducer(sub2HwPort);
     t.after(function () { try { hwSock2.destroy(); } catch (e) {} });
     hwSock2.on('data', function (chunk) {
@@ -674,7 +684,7 @@ test('falls back cleanly to Wayland on --probe SIGSEGV and mid-stream consecutiv
             hwSock2.write(Buffer.alloc(8));
         }
     });
-    hwSock2.write('READY secvideo ilp32\n');
+    hwSock2.write('READY ' + sub2HwToken + ' secvideo ilp32\n');
 
     await waitUntil(function () { return sub2Gst.length === 1; });
     assert.equal(vFail.isEnded(), false, 'viewer must remain connected across mid-stream HW->Wayland failover');
@@ -689,6 +699,7 @@ test('POST api/capture_mode validates, persists, and switches live backend betwe
     var gstCount = 0;
     var hwCount = 0;
     var lastHwPort = 0;
+    var lastHwToken = '';
     var h = createPluginHarness(t, {
         dotnetExists: true,
         onExecute: function (cmd) {
@@ -700,6 +711,7 @@ test('POST api/capture_mode validates, persists, and switches live backend betwe
                 hwCount++;
                 var pm = /--port (\d+)/.exec(plain);
                 lastHwPort = pm ? parseInt(pm[1], 10) : 0;
+                lastHwToken = extractHwToken(cmd);
             } else if (cmd.indexOf('gst-launch-1.0') >= 0) {
                 gstCount++;
             }
@@ -711,10 +723,10 @@ test('POST api/capture_mode validates, persists, and switches live backend betwe
     assert.equal(bad.status, 400);
 
     var viewer = createStreamViewer(h.plugin, '/stream');
-    await waitUntil(function () { return hwCount === 1 && lastHwPort > 0; });
+    await waitUntil(function () { return hwCount === 1 && lastHwPort > 0 && lastHwToken.length > 0; });
     var hs = await connectProducer(lastHwPort);
     t.after(function () { try { hs.destroy(); } catch (e) {} });
-    hs.write('READY secvideo ilp32\n');
+    hs.write('READY ' + lastHwToken + ' secvideo ilp32\n');
 
     // Switch live to Wayland
     var swWayland = await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'wayland' } });
@@ -734,6 +746,7 @@ test('POST api/capture_mode validates, persists, and switches live backend betwe
 
 test('GET api/screenshot during streamKillTimer grace window is not aborted mid-shot and tears down helper afterward', async function (t) {
     var hwPort = 0;
+    var hwToken = '';
     var stopCmds = 0;
     var hdShot = makeFakeJpeg(0xDD, 1920, 1080);
     var hwSock = null;
@@ -747,6 +760,7 @@ test('GET api/screenshot during streamKillTimer grace window is not aborted mid-
             if (plain.indexOf('--serve --port ') >= 0) {
                 var pm = /--port (\d+)/.exec(plain);
                 hwPort = pm ? parseInt(pm[1], 10) : 0;
+                hwToken = extractHwToken(cmd);
             } else if (plain.indexOf('systemctl stop') >= 0) {
                 stopCmds++;
             }
@@ -755,7 +769,7 @@ test('GET api/screenshot during streamKillTimer grace window is not aborted mid-
     });
 
     var viewer = createStreamViewer(h.plugin, '/stream?format=bin');
-    await waitUntil(function () { return hwPort > 0; });
+    await waitUntil(function () { return hwPort > 0 && hwToken.length > 0; });
     hwSock = await connectProducer(hwPort);
     t.after(function () { try { hwSock.destroy(); } catch (e) {} });
 
@@ -778,7 +792,7 @@ test('GET api/screenshot during streamKillTimer grace window is not aborted mid-
             }
         }
     });
-    hwSock.write('READY secvideo ilp32\n');
+    hwSock.write('READY ' + hwToken + ' secvideo ilp32\n');
     await waitUntil(function () { return capCount >= 1; });
 
     // Disconnect sole viewer and immediately request a single-shot screenshot (stopLiveStream(true) flow)
@@ -801,6 +815,7 @@ test('POST api/capture_mode {auto} retries HW after runtime failover and GET api
     var hwStarts = 0;
     var gstCount = 0;
     var lastHwPort = 0;
+    var lastHwToken = '';
     var oneshotCalls = 0;
     var hdShot = makeFakeJpeg(0xEE, 1920, 1080);
     var h = createPluginHarness(t, {
@@ -818,6 +833,7 @@ test('POST api/capture_mode {auto} retries HW after runtime failover and GET api
                 hwStarts++;
                 var pm = /--port (\d+)/.exec(plain);
                 lastHwPort = pm ? parseInt(pm[1], 10) : 0;
+                lastHwToken = extractHwToken(cmd);
             } else if (cmd.indexOf('gst-launch-1.0') >= 0) {
                 gstCount++;
             }
@@ -827,7 +843,7 @@ test('POST api/capture_mode {auto} retries HW after runtime failover and GET api
 
     // Request GET api/screenshot while --serve is still connecting (before READY) -> must reuse --serve without spawning --oneshot-hd
     var viewer = createStreamViewer(h.plugin, '/stream?format=bin');
-    await waitUntil(function () { return hwStarts === 1 && lastHwPort > 0; });
+    await waitUntil(function () { return hwStarts === 1 && lastHwPort > 0 && lastHwToken.length > 0; });
     var shotPromise = invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
 
     var sock1 = await connectProducer(lastHwPort);
@@ -845,7 +861,7 @@ test('POST api/capture_mode {auto} retries HW after runtime failover and GET api
             } catch (e) {}
         }
     });
-    sock1.write('READY secvideo ilp32\n');
+    sock1.write('READY ' + lastHwToken + ' secvideo ilp32\n');
     var shotRes = await shotPromise;
     assert.equal(shotRes.status, 200);
     assert.deepEqual(shotRes.rawBuffer, hdShot);
@@ -861,7 +877,7 @@ test('POST api/capture_mode {auto} retries HW after runtime failover and GET api
     // Clicking Auto while captureMode is already 'auto' (after runtime failover) must retry HW capture live
     var retryRes = await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'auto' } });
     assert.equal(retryRes.status, 200);
-    await waitUntil(function () { return hwStarts === 2; }, 3000);
+    await waitUntil(function () { return hwStarts === 2 && lastHwToken.length > 0; }, 3000);
     var sock2 = await connectProducer(lastHwPort);
     t.after(function () { try { sock2.destroy(); } catch (e) {} });
     var sock2CapCount = 0;
@@ -871,9 +887,151 @@ test('POST api/capture_mode {auto} retries HW after runtime failover and GET api
             try { sock2.write(makeBinFrame(makeFakeJpeg(0x22, 720, 576), 720, 576)); } catch (e) {}
         }
     });
-    sock2.write('READY secvideo ilp32\n');
+    sock2.write('READY ' + lastHwToken + ' secvideo ilp32\n');
     await waitUntil(function () { return sock2CapCount >= 1; }, 3000);
     var st2 = await invokeRoute(h.plugin, { method: 'GET', sub: 'status' });
     assert.equal(st2.json.capture.activeBackend, 'hw');
     assert.equal(viewer.isEnded(), false);
+});
+
+// ==================== 7. SECURITY HARDENING: LOOPBACK HANDSHAKE, SHA RE-CHECK & SHOT IDS ====================
+
+test('loopback stream rejects unauthenticated rogue sockets and second connections while active', async function (t) {
+    var hwPort = 0;
+    var hwToken = '';
+    var gstCount = 0;
+    var validFrame = makeFakeJpeg(0x55, 720, 576);
+    var fakeFrame = makeFakeJpeg(0x99, 720, 576);
+    var h = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 0, stdout: '{"ok":true,"backend":"secvideo","abi":"ilp32"}', stderr: '' };
+            }
+            var plain = decodeWrapSh(cmd);
+            if (plain.indexOf('--serve --port ') >= 0) {
+                var pm = /--port (\d+)/.exec(plain);
+                hwPort = pm ? parseInt(pm[1], 10) : 0;
+                hwToken = extractHwToken(cmd);
+            } else if (cmd.indexOf('gst-launch-1.0') >= 0) {
+                gstCount++;
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+
+    var viewer = createStreamViewer(h.plugin, '/stream?format=bin');
+    await waitUntil(function () { return hwPort > 0 && hwToken.length === 32; });
+
+    // Rogue connection with wrong token before real helper connects must be closed silently without failover
+    var rogue = await connectProducer(hwPort);
+    var rogueClosed = false;
+    rogue.on('close', function () { rogueClosed = true; });
+    rogue.write('READY deadbeefdeadbeefdeadbeefdeadbeef secvideo ilp32\n');
+    await waitUntil(function () { return rogueClosed; });
+    assert.equal(gstCount, 0, 'rogue handshake failure must not abort waiting for real helper');
+
+    // Real helper connects with valid VETRO_STREAM_TOKEN
+    var realSock = await connectProducer(hwPort);
+    t.after(function () { try { realSock.destroy(); } catch (e) {} });
+    var realClosed = false;
+    realSock.on('close', function () { realClosed = true; });
+    realSock.on('data', function (chunk) {
+        if (chunk.toString('ascii').indexOf('CAP ') !== -1) {
+            try { realSock.write(makeBinFrame(validFrame, 720, 576)); } catch (e) {}
+        }
+    });
+    realSock.write('READY ' + hwToken + ' secvideo ilp32\n');
+    await waitUntil(function () { return viewer.getData().indexOf(validFrame) >= 0; });
+
+    // Second connection while realSock is active must be rejected without interrupting realSock or injecting frames
+    var intruder = await connectProducer(hwPort);
+    var intruderClosed = false;
+    intruder.on('close', function () { intruderClosed = true; });
+    try {
+        intruder.write('READY ' + hwToken + ' secvideo ilp32\n');
+        intruder.write(makeBinFrame(fakeFrame, 720, 576));
+    } catch (e) {}
+    await waitUntil(function () { return intruderClosed; });
+    assert.equal(realClosed, false, 'active HW producer must not be replaced by a second connection');
+    assert.equal(viewer.getData().indexOf(fakeFrame), -1, 'intruder frame must not reach viewer');
+
+    // Same duplicate-connection rejection holds on Wayland producer sockets
+    await invokeRoute(h.plugin, { method: 'POST', sub: 'capture_mode', body: { mode: 'wayland' } });
+    var gstPort = 0;
+    var gstSock = null;
+    var hWl = createPluginHarness(t, {
+        dotnetExists: false,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('gst-launch-1.0') >= 0) {
+                gstPort = extractStreamPort(cmd);
+            }
+            return { exit_code: 0, stdout: '', stderr: '' };
+        }
+    });
+    var vWl = createStreamViewer(hWl.plugin, '/stream?format=bin');
+    await waitUntil(function () { return gstPort > 0; });
+    gstSock = await connectProducer(gstPort);
+    t.after(function () { try { gstSock.destroy(); } catch (e) {} });
+    var gstClosed = false;
+    gstSock.on('close', function () { gstClosed = true; });
+    var wlGood = makeFakeJpeg(0x66, 960, 540);
+    gstSock.write(wlGood);
+    await waitUntil(function () { return vWl.getData().indexOf(wlGood) >= 0; });
+
+    var wlIntruder = await connectProducer(gstPort);
+    var wlIntruderClosed = false;
+    wlIntruder.on('close', function () { wlIntruderClosed = true; });
+    try { wlIntruder.write(fakeFrame); } catch (e) {}
+    await waitUntil(function () { return wlIntruderClosed; });
+    assert.equal(gstClosed, false, 'active Wayland producer must not be replaced by second connection');
+    assert.equal(vWl.getData().indexOf(fakeFrame), -1);
+});
+
+test('helper DLL SHA-256 is re-verified on every launch and unsafe DLL/screenshot targets are refused', async function (t) {
+    var crypto = require('node:crypto');
+    var seenShots = [];
+    var oneshotCount = 0;
+    var h = createPluginHarness(t, {
+        dotnetExists: true,
+        onExecute: function (cmd) {
+            if (cmd.indexOf('--probe') >= 0) {
+                return { exit_code: 0, stdout: '{"ok":true,"backend":"secvideo","abi":"ilp32"}', stderr: '' };
+            }
+            var m = /--out '([^']+)'/.exec(cmd || '');
+            if (m) {
+                oneshotCount++;
+                seenShots.push(m[1]);
+            }
+            if (cmd.indexOf('gst-launch-1.0') >= 0 && cmd.indexOf('filesink') >= 0) {
+                var fm = /location='([^']+)'/.exec(cmd);
+                if (fm) seenShots.push(fm[1]);
+            }
+            return { exit_code: 1, stdout: '', stderr: 'mock_fail' };
+        }
+    });
+
+    // First screenshot triggers materialization + oneshot-hd + fallback
+    await invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
+    assert.equal(oneshotCount, 1);
+    var dllPath = path.join(h.files.root, 'runtime', 'hardware-streamer.dll');
+    var validSha = crypto.createHash('sha256').update(fs.readFileSync(dllPath)).digest('hex');
+
+    // Tamper with cached DLL while Shard stays running -> next launch must detect mismatch & restore valid DLL
+    fs.writeFileSync(dllPath, Buffer.from('corrupted-helper-bytes'));
+    await invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
+    assert.equal(oneshotCount, 2);
+    var restoredSha = crypto.createHash('sha256').update(fs.readFileSync(dllPath)).digest('hex');
+    assert.equal(restoredSha, validSha, 'tampered runtime DLL must be re-verified and overwritten before launch');
+
+    // Replacing DLL path with a non-regular file (directory) must be refused without spawning --oneshot-hd
+    fs.unlinkSync(dllPath);
+    fs.mkdirSync(dllPath);
+    var badRes = await invokeRoute(h.plugin, { method: 'GET', sub: 'screenshot' });
+    assert.equal(oneshotCount, 2, 'unsafe runtime/hardware-streamer.dll must never be launched as root');
+    assert.equal(badRes.status, 500);
+
+    // Both runtime/shot_* and fallback /tmp/shot_* names use 24-hex cryptographic IDs
+    assert.ok(seenShots.length >= 2);
+    assert.ok(seenShots.every(function (s) { return /shot_[0-9a-f]{24}\.jpg$/.test(s); }), 'shot paths must use crypto hex IDs');
 });
