@@ -11,6 +11,7 @@
 
 var fs = require('fs');
 var path = require('path');
+var crypto = require('crypto');
 
 var DEFAULT_DATA_DIR = '/mnt/systemrw/tvs-chms/data';
 var DEFAULT_TMP_DIR = '/tmp';
@@ -21,6 +22,7 @@ var CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 var MAX_IMPORT_BYTES = 15 * 1024 * 1024;
 var MAX_UNZIP_BYTES = 32 * 1024 * 1024;
 var MAX_UNZIP_ENTRIES = 50;
+var DEFAULT_STAGED_IMPORT_TTL_MS = 5 * 60 * 1000;
 
 // Note: Samsung Tizen firmware intentionally spells this systemd unit "tvs_deamon.service"
 // (verified on UA50AU7000 Tizen 6.0; "tvs_daemon.service" does not exist). Check both safely.
@@ -761,23 +763,91 @@ function queryChannelsForEdit(ctx, dbPath, defaultSrvType) {
     });
 }
 
-function runSqlFile(ctx, tmpRoot, dbPath, sqlParts, prefix, timeoutMs) {
-    var tmpFile = path.join(tmpRoot, prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6) + '.sql');
-    try {
-        fs.writeFileSync(tmpFile, sqlParts.join('\n'), 'utf8');
-    } catch (fsErr) {
-        return Promise.reject(new Error('Failed to write temp SQL file: ' + fsErr.message));
+function randomHex(byteLen) {
+    return crypto.randomBytes(byteLen || 8).toString('hex');
+}
+
+function buildSavePermsSh() {
+    var lines = [];
+    for (var i = 0; i < ALLOWED_DBS.length; i++) {
+        var f = ALLOWED_DBS[i];
+        lines.push(
+            'M_' + f + '=$(stat -c \'%a\' "$DATA_DIR/' + f + '" 2>/dev/null || echo 0644); ' +
+            'case "$M_' + f + '" in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;; *) M_' + f + '=0644 ;; esac; ' +
+            'O_' + f + '=$(stat -c \'%u:%g\' "$DATA_DIR/' + f + '" 2>/dev/null || echo 0:0); ' +
+            'case "$O_' + f + '" in *[!0-9:]*|""|:*|*:|*:*:*) O_' + f + '=0:0 ;; esac;'
+        );
     }
-    var cmd = wrapSh('sqlite3 -bail ' + shQuote(dbPath) + ' < ' + shQuote(tmpFile) + '; RC=$?; rm -f ' + shQuote(tmpFile) + '; exit $RC');
+    var getPermCases = [];
+    for (var j = 0; j < ALLOWED_DBS.length; j++) {
+        var db = ALLOWED_DBS[j];
+        getPermCases.push(db + ') P_M="$M_' + db + '"; P_O="$O_' + db + '" ;;');
+    }
+    lines.push('get_perm() { case "$1" in ' + getPermCases.join(' ') + ' *) P_M=0644; P_O=0:0 ;; esac; };');
+    return lines.join(' ') + ' ';
+}
+
+function buildMetaHeredocSh(metaObj, destExpr, failAction) {
+    var jsonBody = JSON.stringify(metaObj, null, 2);
+    var delim = '__VETRO_META_' + randomHex(8) + '__';
+    while (jsonBody.indexOf(delim) >= 0) {
+        delim = '__VETRO_META_' + randomHex(8) + '__';
+    }
+    return "cat <<'" + delim + "' > " + destExpr + ' || { ' + failAction + '; }\n' + jsonBody + '\n' + delim + '\n';
+}
+
+function hashStagedFiles(tmpDir, dbFiles) {
+    var hashes = createDict();
+    for (var i = 0; i < dbFiles.length; i++) {
+        var f = dbFiles[i];
+        var p = path.join(tmpDir, f);
+        try {
+            var st = fs.lstatSync(p);
+            if (!st.isFile() || st.isSymbolicLink()) return null;
+            hashes[f] = crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+        } catch (e) {
+            return null;
+        }
+    }
+    return hashes;
+}
+
+function buildStageAndVerifySh(expectedHashes, dbFiles) {
+    if (!dbFiles || dbFiles.length === 0) return '';
+    var parts = [];
+    for (var i = 0; i < dbFiles.length; i++) {
+        var f = dbFiles[i];
+        var qf = shQuote(f);
+        var h = expectedHashes && expectedHashes[f];
+        parts.push(
+            'if [ -L "$TMP_DIR/"' + qf + ' ] || [ ! -f "$TMP_DIR/"' + qf + ' ]; then echo "STAGED_HASH_MISMATCH"; exit 16; fi; ' +
+            'cp "$TMP_DIR/"' + qf + ' "$SAFE_DIR/"' + qf + ' && chmod 0600 "$SAFE_DIR/"' + qf + ' || { echo "STAGED_HASH_MISMATCH"; exit 16; }; '
+        );
+        if (h && /^[0-9a-f]{64}$/.test(h)) {
+            parts.push(
+                'if command -v sha256sum >/dev/null 2>&1; then ' +
+                'GOT_H=$(sha256sum "$SAFE_DIR/"' + qf + ' 2>/dev/null | cut -d" " -f1); ' +
+                'if [ "$GOT_H" != ' + shQuote(h) + ' ]; then echo "STAGED_HASH_MISMATCH"; exit 16; fi; ' +
+                'fi; '
+            );
+        }
+    }
+    return parts.join('');
+}
+
+function runSqlFile(ctx, dbPath, sqlParts, timeoutMs) {
+    var sqlBody = sqlParts.join('\n');
+    var delim = '__VETRO_SQL_' + randomHex(8) + '__';
+    while (sqlBody.indexOf(delim) >= 0) {
+        delim = '__VETRO_SQL_' + randomHex(8) + '__';
+    }
+    var script = 'sqlite3 -bail ' + shQuote(dbPath) + " <<'" + delim + "'\n" + sqlBody + '\n' + delim + '\n';
+    var cmd = wrapSh(script);
     return ctx.execute(cmd, timeoutMs || 15000).then(function (res) {
-        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) { }
         if (res.exit_code !== 0) {
             return Promise.reject(new Error('SQLite command failed on ' + dbPath + ': ' + (res.stderr || 'exit code ' + res.exit_code)));
         }
         return res;
-    }, function (execErr) {
-        try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) { }
-        return Promise.reject(execErr);
     });
 }
 
@@ -835,6 +905,8 @@ function channelsPlugin(ctx) {
     var dbBusy = false;
     var pendingReload = false;
     var pendingImport = null;
+    var pendingImportTimer = null;
+    var stagedImportTtlMs = (ctx && typeof ctx._stagedImportTtlMs === 'number' && ctx._stagedImportTtlMs > 0) ? ctx._stagedImportTtlMs : DEFAULT_STAGED_IMPORT_TTL_MS;
     var dataDir = (ctx && ctx._dataDir) ? String(ctx._dataDir) : DEFAULT_DATA_DIR;
     var tmpRoot = (ctx && ctx._tmpDir) ? String(ctx._tmpDir) : DEFAULT_TMP_DIR;
     var lockFile = path.join(tmpRoot, 'vetro_channels_db.lock');
@@ -843,6 +915,10 @@ function channelsPlugin(ctx) {
     var preEditDir = backupDir ? path.join(backupDir, 'pre-edit') : null;
 
     function clearPendingImport() {
+        if (pendingImportTimer) {
+            clearTimeout(pendingImportTimer);
+            pendingImportTimer = null;
+        }
         if (pendingImport && pendingImport.tmpDir) {
             rmrfSync(pendingImport.tmpDir);
         }
@@ -955,19 +1031,6 @@ function channelsPlugin(ctx) {
         }
         if (dbList.length === 0) return Promise.resolve(false);
 
-        var id = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
-        var metaTmp = path.join(tmpRoot, 'ch_ebak_' + id + '.json');
-        try {
-            fs.writeFileSync(metaTmp, JSON.stringify({
-                createdAt: new Date().toISOString(),
-                slot: 'pre-edit',
-                reason: String(reason || 'edit'),
-                files: dbList.slice()
-            }, null, 2), 'utf8');
-        } catch (metaErr) {
-            return Promise.reject(new Error('Failed to stage pre-edit backup metadata: ' + metaErr.message));
-        }
-
         var ownerUg = getDirOwnerUg();
         var fileArgs = '';
         var bakSteps = '';
@@ -977,9 +1040,15 @@ function channelsPlugin(ctx) {
             fileArgs += (j > 0 ? ' ' : '') + qf;
             var bkSql = ".backup '" + sqlPath(path.join(preEditDir + '.new', bf)) + "'";
             bakSteps += 'if [ -f "$DATA_DIR/"' + qf + ' ]; then ' +
-                'sqlite3 -bail "$DATA_DIR/"' + qf + ' ' + shQuote(bkSql) + ' </dev/null >/dev/null 2>&1 || { rm -rf "$NEW_DIR" "$META_TMP"; echo ' + shQuote('BACKUP_SQLITE_FAILED_' + bf) + '; exit 13; }; ' +
+                'sqlite3 -bail "$DATA_DIR/"' + qf + ' ' + shQuote(bkSql) + ' </dev/null >/dev/null 2>&1 || { rm -rf "$NEW_DIR"; echo ' + shQuote('BACKUP_SQLITE_FAILED_' + bf) + '; exit 13; }; ' +
                 'fi; ';
         }
+        var metaWriteSh = buildMetaHeredocSh({
+            createdAt: new Date().toISOString(),
+            slot: 'pre-edit',
+            reason: String(reason || 'edit'),
+            files: dbList.slice()
+        }, '"$NEW_DIR/backup-meta.json"', 'rm -rf "$NEW_DIR"; echo "BACKUP_META_FAILED"; exit 13');
 
         var script =
             'DATA_DIR=' + shQuote(dataDir) + '; ' +
@@ -987,18 +1056,16 @@ function channelsPlugin(ctx) {
             'SLOT_DIR=' + shQuote(preEditDir) + '; ' +
             'NEW_DIR="${SLOT_DIR}.new"; ' +
             'OLD_DIR="${SLOT_DIR}.old"; ' +
-            'META_TMP=' + shQuote(metaTmp) + '; ' +
             'ANY_SRC=0; ' +
             'for f in ' + fileArgs + '; do ' +
             '  if [ -f "$DATA_DIR/$f" ]; then ANY_SRC=1; break; fi; ' +
             'done; ' +
-            'if [ "$ANY_SRC" -eq 0 ]; then rm -f "$META_TMP"; echo "BACKUP_SKIP"; exit 0; fi; ' +
-            'mkdir -p "$BACKUP_BASE" || { rm -f "$META_TMP"; echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
+            'if [ "$ANY_SRC" -eq 0 ]; then echo "BACKUP_SKIP"; exit 0; fi; ' +
+            'mkdir -p "$BACKUP_BASE" || { echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
             'rm -rf "$NEW_DIR" "$OLD_DIR"; ' +
-            'mkdir -p "$NEW_DIR" || { rm -f "$META_TMP"; echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
+            'mkdir -p "$NEW_DIR" || { echo "BACKUP_MKDIR_FAILED"; exit 13; }; ' +
             bakSteps +
-            'cp "$META_TMP" "$NEW_DIR/backup-meta.json" || { rm -rf "$NEW_DIR" "$META_TMP"; echo "BACKUP_META_FAILED"; exit 13; }; ' +
-            'rm -f "$META_TMP"; ' +
+            metaWriteSh +
             (ownerUg ? ('chown -R ' + shQuote(ownerUg) + ' "$NEW_DIR" 2>/dev/null || true; ') : '') +
             'chmod -R u+rwX,go+rX "$NEW_DIR" 2>/dev/null || true; ' +
             'if [ -d "$SLOT_DIR" ]; then mv "$SLOT_DIR" "$OLD_DIR" || { rm -rf "$NEW_DIR"; echo "BACKUP_ROTATE_FAILED"; exit 13; }; fi; ' +
@@ -1007,14 +1074,10 @@ function channelsPlugin(ctx) {
             'echo "BACKUP_OK"';
 
         return ctx.execute(wrapSh(script), 15000).then(function (r) {
-            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) { }
             if (r.exit_code !== 0) {
                 return Promise.reject(new Error('Pre-edit backup failed (' + ((r.stdout || '').trim() || r.stderr || 'exit code ' + r.exit_code) + '); edit aborted to protect existing data.'));
             }
             return true;
-        }, function (err) {
-            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) { }
-            return Promise.reject(err);
         });
     }
 
@@ -1150,10 +1213,16 @@ function channelsPlugin(ctx) {
                         if (zipModel && tvModel && zipModel.toUpperCase() !== tvModel.toUpperCase()) {
                             warnings.push('Archive filename suggests model "' + zipModel + '", which differs from this TV ("' + tvModel + '").');
                         }
+                        var hashes = hashStagedFiles(tmpDir, dbFiles);
+                        if (!hashes) {
+                            rmrfSync(tmpDir);
+                            return Promise.resolve({ errorCode: 500, error: 'Failed to verify staged database files.' });
+                        }
                         return Promise.resolve({
                             dbFiles: dbFiles,
                             warnings: warnings,
-                            tvModel: tvModel
+                            tvModel: tvModel,
+                            hashes: hashes
                         });
                     }
 
@@ -1184,14 +1253,29 @@ function channelsPlugin(ctx) {
 
     // Phase 2 of import: atomic swap under flock + stopped tvs_deamon.service.
     // EXIT trap cleans staged files and guarantees daemon restart even on error.
-    function runPhase2Swap(tmpDir, dbFiles, sourceName, tvModel) {
+    function runPhase2Swap(tmpDir, dbFiles, sourceName, tvModel, expectedHashes) {
         if (!preImportDir) {
             rmrfSync(tmpDir);
             return Promise.resolve({ errorCode: 500, error: 'Plugin directory unavailable for persistent backup.' });
         }
 
-        var id = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
-        var metaTmp = path.join(tmpRoot, 'ch_bmeta_' + id + '.json');
+        if (expectedHashes) {
+            var currentHashes = hashStagedFiles(tmpDir, dbFiles);
+            if (!currentHashes) {
+                rmrfSync(tmpDir);
+                return Promise.resolve({ errorCode: 409, error: 'Staged import files are missing or invalid. Please upload the archive again.' });
+            }
+            for (var hi = 0; hi < dbFiles.length; hi++) {
+                var hf = dbFiles[hi];
+                if (expectedHashes[hf] && currentHashes[hf] !== expectedHashes[hf]) {
+                    rmrfSync(tmpDir);
+                    return Promise.resolve({ errorCode: 409, error: 'Staged import files changed before apply. Please upload the archive again.' });
+                }
+            }
+        }
+
+        var id = randomHex(8);
+        var safeDir = path.join(tmpRoot, 'ch_stage_' + id);
         var liveFiles = [];
         for (var li = 0; li < ALLOWED_DBS.length; li++) {
             var ldb = ALLOWED_DBS[li];
@@ -1201,43 +1285,44 @@ function channelsPlugin(ctx) {
                 }
             } catch (e) { /* ignore stat error */ }
         }
-        try {
-            fs.writeFileSync(metaTmp, JSON.stringify({
-                createdAt: new Date().toISOString(),
-                slot: 'pre-import',
-                reason: 'import',
-                sourceName: sanitizeFileName(sourceName),
-                files: liveFiles,
-                importedFiles: dbFiles.slice(),
-                model: tvModel || ''
-            }, null, 2), 'utf8');
-        } catch (metaErr) {
-            rmrfSync(tmpDir);
-            return Promise.resolve({ errorCode: 500, error: 'Failed to prepare backup metadata: ' + metaErr.message });
-        }
+        var metaWriteSh = buildMetaHeredocSh({
+            createdAt: new Date().toISOString(),
+            slot: 'pre-import',
+            reason: 'import',
+            sourceName: sanitizeFileName(sourceName),
+            files: liveFiles,
+            importedFiles: dbFiles.slice(),
+            model: tvModel || ''
+        }, '"$BACKUP_NEW/backup-meta.json"', 'rm -rf "$BACKUP_NEW"; echo "BACKUP_META_FAILED"; exit 13');
 
         var ownerUg = getDirOwnerUg();
         var fileArgs = '';
         for (var i = 0; i < dbFiles.length; i++) {
             fileArgs += (i > 0 ? ' ' : '') + shQuote(dbFiles[i]);
         }
+        var stageAndVerifySh = buildStageAndVerifySh(expectedHashes, dbFiles);
 
         var script =
             'exec 9>' + shQuote(lockFile) + '; ' +
             '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
-            TVS_UNIT_RESOLVE +
-            'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
-            'systemctl stop "$UNIT" </dev/null >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
             'DATA_DIR=' + shQuote(dataDir) + '; ' +
             'TMP_DIR=' + shQuote(tmpDir) + '; ' +
+            'SAFE_DIR=' + shQuote(safeDir) + '; ' +
+            'cleanup_early() { rm -rf "$SAFE_DIR" "$TMP_DIR" 2>/dev/null || true; }; ' +
+            'trap cleanup_early EXIT; ' +
+            'mkdir -m 0700 "$SAFE_DIR" || { echo "STAGE_MKDIR_FAILED"; exit 16; }; ' +
+            stageAndVerifySh +
+            TVS_UNIT_RESOLVE +
+            'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
+            buildSavePermsSh() +
+            'systemctl stop "$UNIT" </dev/null >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
             'BACKUP_BASE=' + shQuote(backupDir) + '; ' +
             'BACKUP_DIR=' + shQuote(preImportDir) + '; ' +
             'BACKUP_NEW="${BACKUP_DIR}.new"; ' +
             'BACKUP_OLD="${BACKUP_DIR}.old"; ' +
-            'META_TMP=' + shQuote(metaTmp) + '; ' +
             'RESTARTED=0; ' +
             'cleanup_on_exit() { ' +
-            '  rm -rf "$TMP_DIR" "$META_TMP" 2>/dev/null || true; ' +
+            '  rm -rf "$SAFE_DIR" "$TMP_DIR" 2>/dev/null || true; ' +
             '  if [ "$RESTARTED" -eq 0 ]; then systemctl start "$UNIT" </dev/null >/dev/null 2>&1 || true; RESTARTED=1; sleep 1; ' + VETRO_TUNER_RESTART_SH + '; fi; ' +
             '}; ' +
             'trap cleanup_on_exit EXIT; ' +
@@ -1252,7 +1337,7 @@ function channelsPlugin(ctx) {
             '    cp -p "$DATA_DIR/$f" "$BACKUP_NEW/$f" || { rm -rf "$BACKUP_NEW"; echo "BACKUP_COPY_FAILED"; exit 13; }; ' +
             '  fi; ' +
             'done; ' +
-            'cp "$META_TMP" "$BACKUP_NEW/backup-meta.json" || { rm -rf "$BACKUP_NEW"; echo "BACKUP_META_FAILED"; exit 13; }; ' +
+            metaWriteSh +
             (ownerUg ? ('chown -R ' + shQuote(ownerUg) + ' "$BACKUP_NEW" 2>/dev/null || true; ') : '') +
             'chmod -R u+rwX,go+rX "$BACKUP_NEW" 2>/dev/null || true; ' +
             'if [ -d "$BACKUP_DIR" ]; then mv "$BACKUP_DIR" "$BACKUP_OLD" || { rm -rf "$BACKUP_NEW"; echo "BACKUP_ROTATE_FAILED"; exit 13; }; fi; ' +
@@ -1261,12 +1346,13 @@ function channelsPlugin(ctx) {
             'rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
             'COPY_ERR=0; ' +
             'for f in ' + fileArgs + '; do ' +
-            '  cp "$TMP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || { COPY_ERR=1; break; }; ' +
+            '  get_perm "$f"; ' +
+            '  cp "$SAFE_DIR/$f" "$DATA_DIR/$f" && chmod "$P_M" "$DATA_DIR/$f" && chown "$P_O" "$DATA_DIR/$f" || { COPY_ERR=1; break; }; ' +
             'done; ' +
             'if [ "$COPY_ERR" -ne 0 ]; then ' +
             '  rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
             '  for f in dvbs sat ipsrv dvbt dvbc; do ' +
-            '    if [ -f "$BACKUP_DIR/$f" ]; then cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || true; fi; ' +
+            '    if [ -f "$BACKUP_DIR/$f" ]; then get_perm "$f"; cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod "$P_M" "$DATA_DIR/$f" && chown "$P_O" "$DATA_DIR/$f" || true; fi; ' +
             '  done; ' +
             '  for f in ' + fileArgs + '; do ' +
             '    if [ ! -f "$BACKUP_DIR/$f" ]; then rm -f "$DATA_DIR/$f"; fi; ' +
@@ -1283,7 +1369,6 @@ function channelsPlugin(ctx) {
             'echo "SUCCESS"';
 
         return ctx.execute(wrapSh(script), 30000).then(function (r) {
-            try { if (fs.existsSync(metaTmp)) fs.unlinkSync(metaTmp); } catch (e) { }
             rmrfSync(tmpDir);
             var out = String(r.stdout || '').trim();
             if (out.indexOf('SUCCESS') >= 0 && r.exit_code === 0) {
@@ -1296,6 +1381,9 @@ function channelsPlugin(ctx) {
             }
             if (out.indexOf('LOCKED') >= 0) {
                 return { errorCode: 409, error: 'Database lock held by another operation. Please retry in a few seconds.' };
+            }
+            if (out.indexOf('STAGED_HASH_MISMATCH') >= 0) {
+                return { errorCode: 409, error: 'Staged import files failed integrity check before apply. Please upload the archive again.' };
             }
             if (out.indexOf('NO_TVS_UNIT') >= 0 || out.indexOf('STOP_FAILED') >= 0) {
                 return { errorCode: 500, error: 'Could not stop tvs_deamon.service safely before import; live TV databases were left untouched.' };
@@ -1818,7 +1906,7 @@ function channelsPlugin(ctx) {
                                 if (ipPlan.toDelete.length > 0) bakTargets.push('ipsrv');
 
                                 return savePreEditBackup(bakTargets, 'delete (' + totalDeleted + ' channel(s))').then(function () {
-                                    return runSqlFile(ctx, tmpRoot, targetExecDb, sqlParts, 'ch_del_', 15000).then(function () {
+                                    return runSqlFile(ctx, targetExecDb, sqlParts, 15000).then(function () {
                                         release();
                                         cachedChannels = null;
                                         pendingReload = true;
@@ -1890,7 +1978,7 @@ function channelsPlugin(ctx) {
                                     ];
 
                                     return savePreEditBackup([targetType], 'move (' + moveSrvIds.length + ' channel(s) to #' + target + ')').then(function () {
-                                        return runSqlFile(ctx, tmpRoot, moveDbPath, moveParts, 'ch_mv_', 15000).then(function () {
+                                        return runSqlFile(ctx, moveDbPath, moveParts, 15000).then(function () {
                                             release();
                                             cachedChannels = null;
                                             pendingReload = true;
@@ -1941,7 +2029,7 @@ function channelsPlugin(ctx) {
                                 visParts.push('PRAGMA wal_checkpoint(TRUNCATE);');
                             }
 
-                            runSqlFile(ctx, tmpRoot, visDb, visParts, 'ch_vis_', 12000).then(function () {
+                            runSqlFile(ctx, visDb, visParts, 12000).then(function () {
                                 release();
                                 cachedChannels = null;
                                 pendingReload = true;
@@ -1993,7 +2081,7 @@ function channelsPlugin(ctx) {
                                 'COMMIT;',
                                 'PRAGMA wal_checkpoint(TRUNCATE);'
                             ];
-                            runSqlFile(ctx, tmpRoot, renameDbPath, renameParts, 'ch_ren_', 10000).then(function () {
+                            runSqlFile(ctx, renameDbPath, renameParts, 10000).then(function () {
                                 release();
                                 cachedChannels = null;
                                 pendingReload = true;
@@ -2022,7 +2110,7 @@ function channelsPlugin(ctx) {
             // Includes metadata.xml only if it already exists on this TV (no hardcoded country codes).
             if ((sub === 'export' || action === 'export') && req.method === 'GET') {
                 withDbLock(res, function (release) {
-                    var expId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+                    var expId = randomHex(8);
                     var tmpZipPath = path.join(tmpRoot, 'ch_exp_' + expId + '.zip');
                     var ownerUg = getDirOwnerUg();
                     var exportCmd = wrapSh(
@@ -2111,12 +2199,12 @@ function channelsPlugin(ctx) {
                         try { decodedName = decodeURIComponent(rawHeaderName); } catch (e) { decodedName = rawHeaderName; }
                     }
                     var sourceName = sanitizeFileName(decodedName);
-                    var importId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+                    var importId = randomHex(8);
                     var uploadZip = path.join(tmpRoot, 'ch_up_' + importId + '.zip');
                     var tmpDir = path.join(tmpRoot, 'ch_imp_' + importId);
 
                     var receivedBytes = 0;
-                    var outStream = fs.createWriteStream(uploadZip);
+                    var outStream = fs.createWriteStream(uploadZip, { flags: 'wx', mode: 384 /* 0600 */ });
                     var outClosed = false;
                     var uploadEnded = false;
                     var settled = false;
@@ -2227,14 +2315,22 @@ function channelsPlugin(ctx) {
 
                             if (p1.warnings && p1.warnings.length > 0) {
                                 clearPendingImport();
-                                var confirmToken = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 8);
+                                var confirmToken = randomHex(12);
                                 pendingImport = {
                                     token: confirmToken,
                                     tmpDir: tmpDir,
                                     dbFiles: p1.dbFiles,
                                     sourceName: sourceName,
-                                    tvModel: p1.tvModel
+                                    tvModel: p1.tvModel,
+                                    hashes: p1.hashes,
+                                    expiresAt: Date.now() + stagedImportTtlMs
                                 };
+                                pendingImportTimer = setTimeout(function () {
+                                    clearPendingImport();
+                                }, stagedImportTtlMs);
+                                if (pendingImportTimer && typeof pendingImportTimer.unref === 'function') {
+                                    pendingImportTimer.unref();
+                                }
                                 release();
                                 sendJson(res, 200, {
                                     ok: true,
@@ -2246,7 +2342,7 @@ function channelsPlugin(ctx) {
                                 return;
                             }
 
-                            return runPhase2Swap(tmpDir, p1.dbFiles, sourceName, p1.tvModel).then(function (p2) {
+                            return runPhase2Swap(tmpDir, p1.dbFiles, sourceName, p1.tvModel, p1.hashes).then(function (p2) {
                                 release();
                                 if (p2.ok) {
                                     sendJson(res, 200, p2);
@@ -2281,10 +2377,20 @@ function channelsPlugin(ctx) {
                             sendJson(res, 400, { ok: false, error: 'No matching pending import found. Please upload the archive again.' });
                             return;
                         }
+                        if (pendingImport.expiresAt && Date.now() > pendingImport.expiresAt) {
+                            clearPendingImport();
+                            release();
+                            sendJson(res, 410, { ok: false, error: 'Staged import expired. Please upload the archive again.' });
+                            return;
+                        }
+                        if (pendingImportTimer) {
+                            clearTimeout(pendingImportTimer);
+                            pendingImportTimer = null;
+                        }
                         var staged = pendingImport;
                         pendingImport = null;
 
-                        runPhase2Swap(staged.tmpDir, staged.dbFiles, staged.sourceName, staged.tvModel).then(function (p2) {
+                        runPhase2Swap(staged.tmpDir, staged.dbFiles, staged.sourceName, staged.tvModel, staged.hashes).then(function (p2) {
                             release();
                             if (p2.ok) {
                                 sendJson(res, 200, p2);
@@ -2346,15 +2452,16 @@ function channelsPlugin(ctx) {
                                 for (var fi = 0; fi < files.length; fi++) {
                                     fileArgs += (fi > 0 ? ' ' : '') + shQuote(files[fi]);
                                 }
-                                var rbId = Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+                                var rbId = randomHex(8);
                                 var rbDir = path.join(tmpRoot, 'ch_rb_' + rbId);
                                 var restoreScript =
                                     'exec 9>' + shQuote(lockFile) + '; ' +
                                     '/usr/bin/flock -n 9 || { echo "LOCKED"; exit 10; }; ' +
                                     TVS_UNIT_RESOLVE +
                                     'if [ -z "$UNIT" ]; then echo "NO_TVS_UNIT"; exit 11; fi; ' +
-                                    'systemctl stop "$UNIT" </dev/null >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
                                     'DATA_DIR=' + shQuote(dataDir) + '; ' +
+                                    buildSavePermsSh() +
+                                    'systemctl stop "$UNIT" </dev/null >/dev/null 2>&1 || { echo "STOP_FAILED"; exit 12; }; ' +
                                     'BACKUP_DIR=' + shQuote(slotDir) + '; ' +
                                     'RB_DIR=' + shQuote(rbDir) + '; ' +
                                     'RESTARTED=0; ' +
@@ -2372,12 +2479,13 @@ function channelsPlugin(ctx) {
                                     'rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
                                     'COPY_ERR=0; ' +
                                     'for f in ' + fileArgs + '; do ' +
-                                    '  cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || { COPY_ERR=1; break; }; ' +
+                                    '  get_perm "$f"; ' +
+                                    '  cp "$BACKUP_DIR/$f" "$DATA_DIR/$f" && chmod "$P_M" "$DATA_DIR/$f" && chown "$P_O" "$DATA_DIR/$f" || { COPY_ERR=1; break; }; ' +
                                     'done; ' +
                                     'if [ "$COPY_ERR" -ne 0 ]; then ' +
                                     '  rm -f "$DATA_DIR"/*-wal "$DATA_DIR"/*-shm; ' +
                                     '  for f in dvbs sat ipsrv dvbt dvbc; do ' +
-                                    '    if [ -f "$RB_DIR/$f" ]; then cp "$RB_DIR/$f" "$DATA_DIR/$f" && chmod 0777 "$DATA_DIR/$f" && chown 0:0 "$DATA_DIR/$f" || true; fi; ' +
+                                    '    if [ -f "$RB_DIR/$f" ]; then get_perm "$f"; cp "$RB_DIR/$f" "$DATA_DIR/$f" && chmod "$P_M" "$DATA_DIR/$f" && chown "$P_O" "$DATA_DIR/$f" || true; fi; ' +
                                     '  done; ' +
                                     '  for f in ' + fileArgs + '; do ' +
                                     '    if [ ! -f "$RB_DIR/$f" ]; then rm -f "$DATA_DIR/$f"; fi; ' +

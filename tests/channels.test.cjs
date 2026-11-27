@@ -196,14 +196,12 @@ function createRealSqliteExecutor(customHandler) {
             });
         }
 
-        // 2. runSqlFile: sqlite3 -bail 'db' < 'tmp.sql'; RC=$?; rm -f 'tmp.sql'; exit $RC
-        var fileMatch = /^sqlite3 -bail '((?:[^']|'\\'')*)' < '((?:[^']|'\\'')*)'; RC=\$\?; rm -f/.exec(script);
-        if (fileMatch) {
-            var fDb = fileMatch[1].replace(/'\\''/g, "'");
-            var sqlFile = fileMatch[2].replace(/'\\''/g, "'");
-            var sqlText = fs.readFileSync(sqlFile, 'utf8');
+        // 2. runSqlFile inline here-doc: sqlite3 -bail 'db' <<'__VETRO_SQL_...__'\n...\n__VETRO_SQL_...__
+        var hereMatch = /^sqlite3 -bail '((?:[^']|'\\'')*)' <<'(__VETRO_SQL_[0-9a-f]+__)'\n([\s\S]*?)\n\2\n?$/.exec(script);
+        if (hereMatch) {
+            var fDb = hereMatch[1].replace(/'\\''/g, "'");
+            var sqlText = hereMatch[3];
             var fRes = cp.spawnSync(SQLITE_BIN, ['-bail', fDb], { input: sqlText, encoding: 'utf8' });
-            try { if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile); } catch (e) { }
             return Promise.resolve({
                 exit_code: fRes.status == null ? 1 : fRes.status,
                 stdout: String(fRes.stdout || '').replace(/\r\n/g, '\n'),
@@ -239,18 +237,16 @@ function createRealSqliteExecutor(customHandler) {
             return Promise.resolve(runSqliteSchema(sDb));
         }
 
-        // 5. savePreEditBackup: sqlite3 .backup + atomic swap into backup/pre-edit
+        // 5. savePreEditBackup: sqlite3 .backup + inline meta here-doc + atomic swap into backup/pre-edit
         if (script.indexOf('BACKUP_SQLITE_FAILED_') >= 0) {
             var unBak = script;
             var bDataDir = extractQuotedVar(unBak, 'DATA_DIR');
             var bBase = extractQuotedVar(unBak, 'BACKUP_BASE');
             var bSlot = extractQuotedVar(unBak, 'SLOT_DIR');
-            var bMeta = extractQuotedVar(unBak, 'META_TMP');
             var forM = /for f in ([^;]+); do/.exec(unBak);
             var targets = forM ? forM[1].trim().split(/\s+/).map(function (x) { return x.replace(/'/g, ''); }) : [];
             var existing = targets.filter(function (f) { return fs.existsSync(path.join(bDataDir, f)); });
             if (existing.length === 0) {
-                try { if (fs.existsSync(bMeta)) fs.unlinkSync(bMeta); } catch (e) { }
                 return Promise.resolve({ exit_code: 0, stdout: 'BACKUP_SKIP\n', stderr: '' });
             }
             fs.mkdirSync(bBase, { recursive: true });
@@ -264,12 +260,12 @@ function createRealSqliteExecutor(customHandler) {
                 var bkRes = cp.spawnSync(SQLITE_BIN, ['-bail', path.join(bDataDir, fname), ".backup '" + sqlForward(path.join(newDir, fname)) + "'"], { encoding: 'utf8' });
                 if (bkRes.status !== 0) {
                     try { fs.rmSync(newDir, { recursive: true, force: true }); } catch (e) { }
-                    try { if (fs.existsSync(bMeta)) fs.unlinkSync(bMeta); } catch (e) { }
                     return Promise.resolve({ exit_code: 13, stdout: 'BACKUP_SQLITE_FAILED_' + fname + '\n', stderr: bkRes.stderr || '' });
                 }
             }
-            fs.copyFileSync(bMeta, path.join(newDir, 'backup-meta.json'));
-            try { fs.unlinkSync(bMeta); } catch (e) { }
+            var metaMatch = /cat <<'(__VETRO_META_[0-9a-f]+__)' > "\$NEW_DIR\/backup-meta\.json"[^\n]*\n([\s\S]*?)\n\1/.exec(unBak);
+            assert.ok(metaMatch, 'savePreEditBackup must write backup-meta.json via inline here-document');
+            fs.writeFileSync(path.join(newDir, 'backup-meta.json'), metaMatch[2], 'utf8');
             if (fs.existsSync(bSlot)) fs.renameSync(bSlot, oldDir);
             fs.renameSync(newDir, bSlot);
             try { fs.rmSync(oldDir, { recursive: true, force: true }); } catch (e) { }
@@ -869,6 +865,12 @@ test('two-phase import stages mismatches for explicit confirmation, cleans on ca
     assert.ok(p2s.indexOf('metadata.xml') < 0, 'Phase 2 swap must NEVER overwrite TV metadata.xml');
     assert.ok(p2s.indexOf('change_source') < 0, 'Phase 2 swap must NEVER force TV input switch');
     assert.ok(p2s.indexOf('if [ ! -f "$BACKUP_DIR/$f" ]; then rm -f "$DATA_DIR/$f"; fi;') >= 0, 'rollback removes newly-introduced DBs');
+    assert.equal(p2s.indexOf('0777'), -1, 'Phase 2 swap must never hardcode chmod 0777');
+    assert.ok(p2s.indexOf("stat -c '%a'") >= 0 && p2s.indexOf('0644') >= 0, 'Phase 2 swap must preserve existing mode via stat with 0644 default');
+    assert.ok(p2s.indexOf('mkdir -m 0700 "$SAFE_DIR"') >= 0 && p2s.indexOf('cp "$SAFE_DIR/$f" "$DATA_DIR/$f"') >= 0, 'Phase 2 swap must stage and copy from root-only 0700 SAFE_DIR');
+    assert.ok(p2s.indexOf('STAGED_HASH_MISMATCH') >= 0 && p2s.indexOf('sha256sum "$SAFE_DIR/"') >= 0, 'Phase 2 swap must verify staged SHA-256 inside SAFE_DIR under flock');
+    assert.ok(/cat <<'__VETRO_META_[0-9a-f]+__' > "\$BACKUP_NEW\/backup-meta\.json"/.test(p2s), 'Phase 2 swap writes backup-meta.json via inline here-document');
+    assert.equal(fs.readdirSync(env.tmpDir).filter(function (n) { return n.indexOf('ch_bmeta_') === 0 || n.indexOf('ch_ebak_') === 0; }).length, 0);
 });
 
 test('B4: timed-out Phase 2 swap never deletes tmpDir from Node or spawns a competing restore', async function (t) {
@@ -1302,3 +1304,127 @@ if (process.platform !== 'win32') {
         assert.match(fs.readFileSync(sysLog, 'utf8'), /stop tvs_deamon\.service[\s\S]*start tvs_deamon\.service/);
     });
 }
+
+test('hardening: inline SQL here-doc avoids /tmp/*.sql, restore preserves mode via stat, and staged imports verify SHA-256 + expire', async function (t) {
+    var env = createTempEnv(t);
+    var dbs = createTvDatabases(env.dataDir, { userVersion: 7 });
+
+    // Create valid pre-edit backup so we can also assert restore-backup script permissions
+    var preEditDir = path.join(env.pluginDir, 'backup', 'pre-edit');
+    fs.mkdirSync(preEditDir, { recursive: true });
+    fs.copyFileSync(dbs.dvbsPath, path.join(preEditDir, 'dvbs'));
+    fs.writeFileSync(path.join(preEditDir, 'backup-meta.json'), JSON.stringify({ createdAt: '2026-11-24T12:00:00Z', files: ['dvbs'] }));
+
+    var stagedSource = path.join(env.root, 'zip_src');
+    fs.mkdirSync(stagedSource, { recursive: true });
+    createTvDatabases(stagedSource, { userVersion: 7 });
+
+    var restoreScripts = [];
+    var phase2Called = 0;
+    var exec = createRealSqliteExecutor(function (cmd, timeoutMs, helpers) {
+        if (cmd.indexOf('/usr/bin/unzip -l') >= 0) {
+            return {
+                exit_code: 0,
+                stdout: '__LIST_START__\n  131072  2026-01-01 12:00   dvbs\n  131072  2026-01-01 12:00   metadata.xml\n__LIST_END__\n',
+                stderr: ''
+            };
+        }
+        if (cmd.indexOf('/usr/bin/unzip -o -q') >= 0) {
+            var upZip = helpers.extractQuotedVar(cmd, 'UP');
+            var tDir = helpers.extractQuotedVar(cmd, 'TMP');
+            fs.mkdirSync(tDir, { recursive: true });
+            fs.copyFileSync(path.join(stagedSource, 'dvbs'), path.join(tDir, 'dvbs'));
+            try { if (fs.existsSync(upZip)) fs.unlinkSync(upZip); } catch (e) { }
+            return {
+                exit_code: 0,
+                stdout: '__DBS__= dvbs\n__IMP_META_START__\n<METADATA><DIGITAL_COUNTRY>5198920</DIGITAL_COUNTRY></METADATA>\n__IMP_META_END__\n__TV_META_START__\n<METADATA><DIGITAL_COUNTRY>9999999</DIGITAL_COUNTRY></METADATA>\n__TV_META_END__\n',
+                stderr: ''
+            };
+        }
+        if (cmd.indexOf('COPY_ROLLED_BACK') >= 0) {
+            phase2Called++;
+            return { exit_code: 0, stdout: 'SUCCESS\n', stderr: '' };
+        }
+        if (cmd.indexOf('RESTORE_ROLLED_BACK') >= 0) {
+            restoreScripts.push(cmd);
+            return { exit_code: 0, stdout: 'SUCCESS\n', stderr: '' };
+        }
+        return undefined;
+    });
+
+    var p = pluginFactory({
+        dir: env.pluginDir,
+        _dataDir: env.dataDir,
+        _tmpDir: env.tmpDir,
+        _stagedImportTtlMs: 80,
+        execute: exec.execute
+    });
+    p.start();
+    t.after(function () { p.stop(); });
+
+    // 1. Edit runs SQL via inline here-document with zero ch_*.sql or ch_ebak_*.json files left in tmpDir
+    var renameRes = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'edit',
+        body: { action: 'rename', type: 'dvbs', srvId: '101', name: 'Renamed One' }
+    });
+    assert.equal(renameRes.json.ok, true);
+    var mvPreBakRes = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'edit',
+        body: { action: 'move', type: 'dvbs', srvId: '101', target: 2 }
+    });
+    assert.equal(mvPreBakRes.json.ok, true);
+    var preEditMeta = JSON.parse(fs.readFileSync(path.join(env.pluginDir, 'backup', 'pre-edit', 'backup-meta.json'), 'utf8'));
+    assert.equal(preEditMeta.slot, 'pre-edit');
+    var sqlTmpFiles = fs.readdirSync(env.tmpDir).filter(function (n) { return /\.sql$/.test(n) || n.indexOf('ch_ebak_') === 0 || n.indexOf('ch_bmeta_') === 0; });
+    assert.equal(sqlTmpFiles.length, 0, 'no temporary .sql or meta JSON files should ever be written to tmpDir');
+    assert.ok(exec.log.some(function (entry) { return /sqlite3 -bail .* <<'__VETRO_SQL_[0-9a-f]+__'/.test(entry.script); }));
+
+    // 2. Restore backup script preserves mode/owner via stat (defaulting 0644 / 0:0, zero chmod 0777)
+    var rbRes = await invokeRoute(p, { method: 'POST', sub: 'restore-backup', body: { slot: 'pre-edit' } });
+    assert.equal(rbRes.json.ok, true);
+    assert.equal(restoreScripts.length, 1);
+    assert.equal(restoreScripts[0].indexOf('0777'), -1);
+    assert.ok(restoreScripts[0].indexOf("stat -c '%a'") >= 0 && restoreScripts[0].indexOf('0644') >= 0);
+
+    // 3. Staged import rejects tampered staged file before stopping tvs_deamon.service (409)
+    var up1 = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import',
+        url: '/import?name=mismatch.zip',
+        headers: { 'content-type': 'text/plain' },
+        body: Buffer.from('PK_FAKE')
+    });
+    assert.equal(up1.json.needsConfirm, true);
+    var stagedDirs = fs.readdirSync(env.tmpDir).filter(function (n) { return n.indexOf('ch_imp_') === 0; });
+    assert.equal(stagedDirs.length, 1);
+    fs.writeFileSync(path.join(env.tmpDir, stagedDirs[0], 'dvbs'), 'TAMPERED_DB_BYTES');
+    var badConfirm = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import-confirm',
+        body: { confirmToken: up1.json.confirmToken }
+    });
+    assert.equal(badConfirm.status, 409);
+    assert.match(badConfirm.json.error, /changed before apply/i);
+    assert.equal(phase2Called, 0, 'tampered staged import must be rejected before running Phase 2');
+
+    // 4. Staged import expires cleanly after TTL and removes temporary staged directory
+    var up2 = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import',
+        url: '/import?name=mismatch.zip',
+        headers: { 'content-type': 'text/plain' },
+        body: Buffer.from('PK_FAKE')
+    });
+    assert.equal(up2.json.needsConfirm, true);
+    assert.equal(fs.readdirSync(env.tmpDir).filter(function (n) { return n.indexOf('ch_imp_') === 0; }).length, 1);
+    await new Promise(function (resolve) { setTimeout(resolve, 140); });
+    assert.equal(fs.readdirSync(env.tmpDir).filter(function (n) { return n.indexOf('ch_imp_') === 0; }).length, 0, 'expired staged dir must be deleted');
+    var expiredConfirm = await invokeRoute(p, {
+        method: 'POST',
+        sub: 'import-confirm',
+        body: { confirmToken: up2.json.confirmToken }
+    });
+    assert.equal(expiredConfirm.status, 400);
+});
